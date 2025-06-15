@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <cuda_runtime.h>
 #include <cuda.h>
+#include "include/CudaCommon.h"
 
 
 template <int ROW_M_PER_BLOCK, int COL_N_PER_BLOCK, int NUM_K_PER_BLOCK, int ROW_NUM_M_PER_THREADS, int COL_NUM_N_PER_THREADS, int NUM_K_PER_THREADS>
@@ -373,20 +374,20 @@ void SingleGEMM(const float *hGEMMA, const float *hGEMMB, const int M, const int
 
     float *dGEMMA = nullptr;
     size_t pitchA = 0;
-    cudaMallocPitch((void**)&dGEMMA, &pitchA, dK * sizeof(float), dM);
-    cudaMemset2D(dGEMMA, pitchA, 0, dK * sizeof(float), dM);
-    cudaMemcpy2D(dGEMMA, pitchA, hGEMMA, K * sizeof(float), K * sizeof(float), M, cudaMemcpyHostToDevice);
+    checkCudaErrors(cudaMallocPitch((void**)&dGEMMA, &pitchA, dK * sizeof(float), dM));
+    checkCudaErrors(cudaMemset2D(dGEMMA, pitchA, 0, dK * sizeof(float), dM));
+    checkCudaErrors(cudaMemcpy2D(dGEMMA, pitchA, hGEMMA, K * sizeof(float), K * sizeof(float), M, cudaMemcpyHostToDevice));
 
     float *dGEMMB = nullptr;
     size_t pitchB = 0;
-    cudaMallocPitch((void**)&dGEMMB, &pitchB, dN * sizeof(float), dK);
-    cudaMemset2D(dGEMMB, pitchB, 0, dN * sizeof(float), dK);
-    cudaMemcpy2D(dGEMMB, pitchB, hGEMMB, N * sizeof(float), N * sizeof(float), K, cudaMemcpyHostToDevice);
+    checkCudaErrors(cudaMallocPitch((void**)&dGEMMB, &pitchB, dN * sizeof(float), dK));
+    checkCudaErrors(cudaMemset2D(dGEMMB, pitchB, 0, dN * sizeof(float), dK));
+    checkCudaErrors(cudaMemcpy2D(dGEMMB, pitchB, hGEMMB, N * sizeof(float), N * sizeof(float), K, cudaMemcpyHostToDevice));
 
     float *dGEMMC = nullptr;
     size_t pitchC = 0;
-    cudaMallocPitch((void**)&dGEMMC, &pitchC, dN * sizeof(float), dM);
-    cudaMemset2D(dGEMMC, pitchC, 0, dN * sizeof(float), dM);
+    checkCudaErrors(cudaMallocPitch((void**)&dGEMMC, &pitchC, dN * sizeof(float), dM));
+    checkCudaErrors(cudaMemset2D(dGEMMC, pitchC, 0, dN * sizeof(float), dM));
 
     int paddingA = pitchA / sizeof(float);
     int paddingB = pitchB / sizeof(float);
@@ -403,7 +404,7 @@ void SingleGEMM(const float *hGEMMA, const float *hGEMMB, const int M, const int
     SingleGEMMKernelV3<rowMPerBlock, colNPerBlock, numKPerBlock, rowNumMPerThreads, colNumNPerThreads, stepK><<<gridSize, blockSize>>>(dGEMMA, dGEMMB, 
         dM, dN, dK, paddingA, paddingB, paddingC, dGEMMC);
     cudaDeviceSynchronize();
-    cudaMemcpy2D(hGEMMC, sizeof(float) * N, dGEMMC, pitchC, N * sizeof(float), M, cudaMemcpyDeviceToHost);
+    checkCudaErrors(cudaMemcpy2D(hGEMMC, sizeof(float) * N, dGEMMC, pitchC, N * sizeof(float), M, cudaMemcpyDeviceToHost));
 
     for (int i = 0; i < M * N; ++i)
     {
@@ -416,9 +417,9 @@ void SingleGEMM(const float *hGEMMA, const float *hGEMMB, const int M, const int
         }
     }
 
-    if (dGEMMA) cudaFree(dGEMMA);
-    if (dGEMMB) cudaFree(dGEMMB);
-    if (dGEMMC) cudaFree(dGEMMC);
+    if (dGEMMA) checkCudaErrors(cudaFree(dGEMMA));
+    if (dGEMMB) checkCudaErrors(cudaFree(dGEMMB));
+    if (dGEMMC) checkCudaErrors(cudaFree(dGEMMC));
 }
 
 void SingleGEMMRun()
@@ -454,7 +455,7 @@ void SingleGEMMRun()
 int main()
 {
     cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0); // 0 是 device ID
+    checkCudaErrors(cudaGetDeviceProperties(&prop, 0)); // 0 是 device ID
     printf("Shared memory per block: %zu bytes\n", prop.sharedMemPerBlock);
 
     SingleGEMMRun();

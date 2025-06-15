@@ -19,6 +19,11 @@ set(CUDA_NVCC_FLAGS "-g -G -O0")
 find_package(CUDAToolkit REQUIRED)
 
 add_executable(CudaReduce CudaReduce.cu)
+
+target_include_directories(CudaReduce PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
 target_link_libraries(CudaReduce PRIVATE CUDA::cudart ${CUDA_cublas_LIBRARY})
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(CudaReduce PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-G>)

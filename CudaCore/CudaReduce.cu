@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "include/CudaCommon.h"
 
 template <int NUM_THREADS_PER_BLOCK, int NUM_PER_THREADS, int WARP_SIZE>
 __global__ void cudaReduceSumKernel(const float *dInput, const int inputSize, float *dOutput)
@@ -106,31 +107,31 @@ void cudaReduceSum(const float *hInput, const float inputSize, float *hOutput)
     int numDeviceInputSize = gridSizeX * numDataPerThreads * numThreadsPerBlock;
 
     float *dInput = nullptr;
-    cudaMalloc((void**)&dInput, sizeof(float) * numDeviceInputSize);
-    cudaMemset(dInput, 0, sizeof(float) * numDeviceInputSize);
-    cudaMemcpy(dInput, hInput, sizeof(float) * inputSize, cudaMemcpyHostToDevice);
+    checkCudaErrors(cudaMalloc((void**)&dInput, sizeof(float) * numDeviceInputSize));
+    checkCudaErrors(cudaMemset(dInput, 0, sizeof(float) * numDeviceInputSize));
+    checkCudaErrors(cudaMemcpy(dInput, hInput, sizeof(float) * inputSize, cudaMemcpyHostToDevice));
     
     float *dOutput = nullptr;
-    cudaMalloc((void**)&dOutput, sizeof(float));
-    cudaMemset(dOutput, 0, sizeof(float));
+    checkCudaErrors(cudaMalloc((void**)&dOutput, sizeof(float)));
+    checkCudaErrors(cudaMemset(dOutput, 0, sizeof(float)));
 
     dim3 blockSize(numThreadsPerBlock);
     dim3 gridSize(gridSizeX);
     cudaReduceSumKernel<numThreadsPerBlock, numDataPerThreads, 32><<<gridSize, blockSize>>>(dInput, numDeviceInputSize, dOutput);
     cudaDeviceSynchronize();
-    cudaMemcpy(hOutput, dOutput, sizeof(float), cudaMemcpyDeviceToHost);
+    checkCudaErrors(cudaMemcpy(hOutput, dOutput, sizeof(float), cudaMemcpyDeviceToHost));
     std::cout << "cudaReduceSum = " << *hOutput << std::endl;
 
-    cudaMemset(dOutput, 0, sizeof(float));
-    cudaMemset(dInput, 0, sizeof(float) * numDeviceInputSize);
-    cudaMemcpy(dInput, hInput, sizeof(float) * inputSize, cudaMemcpyHostToDevice);
+    checkCudaErrors(cudaMemset(dOutput, 0, sizeof(float)));
+    checkCudaErrors(cudaMemset(dInput, 0, sizeof(float) * numDeviceInputSize));
+    checkCudaErrors(cudaMemcpy(dInput, hInput, sizeof(float) * inputSize, cudaMemcpyHostToDevice));
     cudaReduceSumKernelV2<numThreadsPerBlock, numDataPerThreads, 32><<<gridSize, blockSize>>>(dInput, numDeviceInputSize, dOutput);
     cudaDeviceSynchronize();
-    cudaMemcpy(hOutput, dOutput, sizeof(float), cudaMemcpyDeviceToHost);
+    checkCudaErrors(cudaMemcpy(hOutput, dOutput, sizeof(float), cudaMemcpyDeviceToHost));
     std::cout << "cudaReduceSumKernelV2 = " << *hOutput << std::endl;
 
-    if (dInput) cudaFree(dInput);
-    if (dOutput) cudaFree(dOutput);
+    if (dInput) checkCudaErrors(cudaFree(dInput));
+    if (dOutput) checkCudaErrors(cudaFree(dOutput));
 }
 
 void cudaReduceSumRun()
@@ -155,7 +156,7 @@ void cudaReduceSumRun()
 int main()
 {
     cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0); // 0 是 device ID
+    checkCudaErrors(cudaGetDeviceProperties(&prop, 0)); // 0 是 device ID
     printf("Shared memory per block: %zu bytes\n", prop.sharedMemPerBlock);
     cudaReduceSumRun();
 
