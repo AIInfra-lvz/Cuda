@@ -5,7 +5,7 @@
 
 namespace cg = cooperative_groups;
 
-static inline __host__ __device__ uint32_t iDivUp(uint32_t a, uint32_t b) { return ((a % b) == 0) ? (a / b) : (a / b + 1); }
+// static inline __host__ __device__ uint32_t iDivUp(uint32_t a, uint32_t b) { return ((a % b) == 0) ? (a / b) : (a / b + 1); }
 
 #define W (sizeof(uint32_t) * 8)
 static inline __device__ uint32_t nextPowerOfTwo(uint32_t x)

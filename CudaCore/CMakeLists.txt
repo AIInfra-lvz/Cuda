@@ -18,13 +18,10 @@ set(CUDA_NVCC_FLAGS "-g -G -O0")
 
 find_package(CUDAToolkit REQUIRED)
 
-add_executable(CudaReduce CudaReduce.cu)
-
-target_include_directories(CudaReduce PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 if(0)
+    add_executable(CudaReduce CudaReduce.cu)
     target_link_libraries(CudaReduce PRIVATE CUDA::cudart ${CUDA_cublas_LIBRARY})
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         target_compile_options(CudaReduce PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-G>)
@@ -41,11 +38,20 @@ if(0)
     target_compile_options(GEMM PRIVATE -lineinfo)
 endif()
 
-if(1)
+if(0)
     add_executable(mergeSort mergeSort.cu)
     target_link_libraries(mergeSort PRIVATE CUDA::cudart ${CUDA_cublas_LIBRARY})
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         target_compile_options(mergeSort PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-G>)
     endif()
     target_compile_options(mergeSort PRIVATE -lineinfo)
+endif()
+
+if(1)
+    add_executable(convolutionSeparable convolutionSeparable.cu)
+    target_link_libraries(convolutionSeparable PRIVATE CUDA::cudart ${CUDA_cublas_LIBRARY})
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        target_compile_options(convolutionSeparable PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-G>)
+    endif()
+    target_compile_options(convolutionSeparable PRIVATE -lineinfo)
 endif()

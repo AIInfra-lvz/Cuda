@@ -3,6 +3,8 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+inline __host__ __device__ constexpr  uint32_t iDivUp(uint32_t a, uint32_t b) { return ((a % b) == 0) ? (a / b) : (a / b + 1); }
+
 static const char *_cudaGetErrorEnum(cudaError_t error)
 {
     return cudaGetErrorString(error);
