@@ -1,0 +1,24 @@
+cmake_minimum_required(VERSION 3.19 FATAL_ERROR)
+cmake_policy(SET CMP0112 NEW)
+
+project(fmha_blackwell_sm120 VERSION 0.1.0 LANGUAGES CUDA CXX C)
+
+add_executable(fmha fmha.cu)
+
+target_include_directories(fmha PRIVATE
+    ${CMAKE_SOURCE_DIR}/fmha_blackwell_sm120
+)
+
+file(GLOB LIBS "${CMAKE_SOURCE_DIR}/lib/*_gemm_*.so")
+
+target_link_libraries(fmha PRIVATE 
+    CUDA::cudart 
+    ${CUDA_cublas_LIBRARY}
+    ${LIBS}
+)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_options(fmha PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-G>)
+endif()
+
+target_compile_options(fmha PRIVATE -lineinfo)
