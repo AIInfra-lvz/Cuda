@@ -5,6 +5,7 @@
 
 #include "cutlass/cutlass.h"
 #include "cute/tensor.hpp"
+#include "cutlass/kernel_hardware_info.h"
 
 namespace cutlass::fmha::kernel
 {

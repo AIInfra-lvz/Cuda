@@ -414,7 +414,7 @@ struct Sm120FmhaFwdKernelTmaWarpspecialized
     }
     else if (role == KernelSchedule::WarpRole::Correction)
     {
-      cutlass::arch::warpgroup_reg_dealloc<NumRegsCorrection>();
+      warpgroup_reg_set<NumRegsCorrection>();
 
       CUTLASS_PRAGMA_NO_UNROLL
       while (tile_scheduler.is_valid())
