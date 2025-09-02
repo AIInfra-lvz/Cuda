@@ -531,5 +531,37 @@ public:
 }
 ```
 Obviously, both `full_barrier_ptr_` and `empty_barrier_ptr_` are arrays in shared memory (SMEM) and work together to maintain synchronization. `empty_barrier_ptr_` records the status of the producer buffer, while `full_barrier_ptr_` records the status of the consumer buffer. When `producer_acquire` is called, it updates the buffer status in the `empty_barrier_ptr_` array at the position specified by the `index_` and `phase_` fields of `PipelineState`. Similarly, the `full_barrier_ptr_` array is updated for the consumer side. For more details, refer to cutlass/pipeline/sm90_pipeline.hpp.
+## Tile Scheduler
+This section will illustrate two tile scheduling strategies: persistent and non-persistent tile schedulers.
+### No-Persistent Tile scheduler
+In a non-persistent tile scheduler, each CTA completes only one tile of computation. For example, `IndividualTileScheduler` is non-persistent in FMHA because its grid shape is set as shown in the following code snippet.
+```
+template<class ProblemSize, class ClusterShape, class TileShape>
+static Params to_underlying_arguments(
+  const ProblemSize& problem_size, KernelHardwareInfo hw_info,
+  const ClusterShape& cluster_shape, const TileShape& tile_shape)
+{
+    dim3 grid(round_up(ceil_div(size<0>(problem_size), size<0>(tile_shape)), size<0>(cluster_shape)), 
+        size<3,0>(problem_size), 
+        size<3,1>(problem_size));
+    return Params{ grid };
+}
+```
+### Persistent Tile scheduler
+In contrast, the persistent tile scheduler allows each CTA to process multiple work units (tiles), with each work unit's offset being `gridDim.x`. The grid shape is set to the number of SMs if the number of work units exceeds the number of SMs.
+```
+static dim3 get_grid_shape(Params const& params)
+{
+    dim3 grid(std::min(params.num_blocks, params.hw_info.sm_count), 1, 1);
+    return grid;
+}
+```
+In this way, it can mitigate both load imbalance and the **wave quantization** problem.   
+**Wave quantization**   
+When the number of work units exceeds the number of available SMs, the work units are processed in multiple waves. One wave is defined as each available SM completing a single work unit. **Wave quantization** occurs when the number of work units is not evenly divisible by the number of available SMs. For example, consider a case with 10 work units and 4 SMs. The work unit execution timeline would look like:    
+![Wave quantization](./src_pictures/wave_quantization.png)    
+In this case, the first two waves are full waves, with every SM being utilized. However, the final wave is a partial wave, where only half of the SMs are occupied.    
+
+However, the persistent tile scheduler can maintain high SM utilization by reducing the idle time that occurs while SMs wait to be assigned new CTAs, thereby mitigating the wave quantization problem. More information about **wave quantization** and additional performance guidance can be found in the blog post [CUTLASS Tutorial: Persistent Kernels and Stream-K](https://research.colfax-intl.com/cutlass-tutorial-persistent-kernels-and-stream-k/) and the [NVIDIA Deep Learning Performance Guide](https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#math-mem).
 # Collective Layer
-...
+Updating... ... ...
