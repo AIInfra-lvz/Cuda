@@ -66,9 +66,9 @@ struct Sm120FmhaFwdKernelTmaWarpspecialized
     static const int NumWarpsLoad = 1;
 
     static const bool kDebugUsingPrintf = false;
-    static const int NumRegsSoftmax = 192;
+    static const int NumRegsSoftmax = 184;
     static const int NumRegsCorrection = 96 - (kDebugUsingPrintf ? 16 : 0);
-    static const int NumRegsOther = 32 + (kDebugUsingPrintf ? 16 : 0);
+    static const int NumRegsOther = 48 + (kDebugUsingPrintf ? 16 : 0);
     static const int NumRegsEmpty = 24;
 
     static const int NumWarps = 16;
