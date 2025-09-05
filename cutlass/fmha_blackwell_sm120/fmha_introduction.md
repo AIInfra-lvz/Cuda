@@ -13,36 +13,48 @@ Additionally, as this article serves as learning notes for CUTLASS, there may be
 
 # Overview
 There are two main sections: the first is about FMHA mathematical theory, and the second is about the program execution pipeline. Introducing these two sections first helps to understand the overall logic of FMHA, which in turn aids in grasping the detailed design.
+
 ## Mathematical Theory
 The attention module in the transformer architecture has several variants: MHA, GQA, VL-MHA, Gen-MHA, and MHLA. The FMHA being called simply implements these principles using a kernel. The documentation currently only introduces the first two; the others will be improved in the future.
+
 ### MHA
 MHA is the most basic form of attention, and its theory is described below.
+
 $$
 \mathrm{softmax}\left(\frac{Q K^T}{\sqrt{d}}\right) V \\\\
 \mathrm{softmax}(x_i) = \frac{2^{\log_2 e \cdot (x_i - \max_j x_j)}}{\sum_k 2^{\log_2 e \cdot (x_k - \max_j x_j)}} 
 $$
+
 Obviously, there are three main steps: multiplying matrices Q and K, computing the softmax, and multiplying the result of the first two steps by matrix V. The matrix Q has the same number of heads as matrices K and V.
+
 ### GQA
 The basic computation of GQA remains unchanged, but a major difference is that matrices K and V have only one head for several heads of matrix Q, so the number of heads in K and V corresponds to the number of groups in Q.
+
 $$
 \mathrm{softmax}\left(\frac{Q_i K_{g(i)}^T}{\sqrt{d}}\right) V_{g(i)}
 $$
+
 Here, $Q_i$ denotes the $i$-th query, and $K_{g(i)}$ and $V_{g(i)}$ denote the key and value that belong to the same group as $Q_i$. Softmax computation is the same as in MHA.
+
 ## Pipeline
 As shown in the picture below, the basic computing steps of FMHA are illustrated in a simple flow chart. The complex details will be discussed in the kernel and collective sections.   
+
 ![Compute Pipeline](./src_pictures/pipeline.png)    
+
 The flow chart illustrates the flow of each fragmented computation within a block of the CUDA kernel. Each node consists of two parts: stage and detail. The stages include Load, MMA, Softmax, Correction, and Epilogue. These stages represent the organizational structure in the post-kernel layer. The details show the specific events that are carried out in the collective layer. In addition, the side-by-side nodes can be seen as being executed in parallel, and the overlap of multi-stage memory access and computation is not shown.
 
 # Device Layer
 Firstly, we will discuss the top layer of CUTLASS: device. The device layer describes the host code responsible for two main tasks: the conversion of outer arguments to inner parameters and the launch methods of CUDA kernels. It serves as the entry point for running the kernel. We will not explain every sentence or line of code, so you may need to read some coding details on your own in fmha_blackwell_sm120/device/fmha.hpp.
 
 The template parameter of device layer class is the kernel layer template class, which provides the methods for the argument conversion, shared memory size, grid shape and other global memory size if needed.
+
 ## Task 1
 The part directly uses the methods of the kernel layer to convert the arguments to parameters, which is done automically in initialize function. The function will also automically check whether the shared memory size is reasonable and attempt to adjust it if necessary.
 ```
 Status initialize(const Arguments& args, void* workspace = nullptr, cudaStream_t stream = nullptr)
 ```
 Note: This function is non-static, which is different from many other functions.
+
 ## Task 2
 The part needs to overload several run functions, but only one function acutually executes kernel, while the others call it in internally. These run functions mainly cover scenarios such as unchanged arguments, changed arguments and provide advanced method to run kernel when a non-class object is initialized. Therefore, the run function need to be static.
 ```
@@ -83,6 +95,7 @@ else
     device_kernel<Kernel><<<grid, block, smem_size, stream>>>(params);
 }
 ```
+
 ### Cluster
 Cluster launch is supported in Hopper and Blackwell architectures, and one of its abilities is to provide a multi-broadcast function. Multi-broadcast can broadcast data to different blocks within the same cluster when those blocks need the same tiled data, which can significantly reduce memory access time.
 ```
@@ -95,13 +108,16 @@ dimension.
 
 # Kernel Layer
 There are also two main sections in the kernel layer: pipeline organization and tile scheduler. The computation pipeline for one tile within a block has already been illustrated in the Overview section, so the following pipeline provides more details about the pipelines.
+
 ## Pipeline Origanization
 Before introducing pipeline organization, we should learn about three important things: first, the Tensor Memory Accelerator (TMA); second, Tensor Memory (TMEM); and third, warp-specialized kernel schedules. These are helpful for us to grasp the pipeline parameters design and register allocation within pipeline organization.
+
 ### Tensor Memory Accelerator (TMA)
 A [blog](https://research.colfax-intl.com/tutorial-hopper-tma/) is recommended for a detailed understanding of TMA. This section refers to that blog.
 TMA is a new feature introduced in the NVIDIA Hopper™ architecture for doing asynchronous memory copy between a GPU’s global memory (GMEM) and the shared memory (SMEM) of its threadblocks (i.e., CTAs). Therefore, it is only useful on architectures with compute capability 90a or higher. Instead of implementing TMA, this section focuses on understanding what TMA is and its usage limitations. The usage of TMA will be demonstrated in the load stage of the collective layer with code examples.    
 
 We divide the TMA section into three main parts: the first covers TMA load, the second covers TMA store, and the third discusses more advanced operations such as TMA store reduce and TMA load multicast. In essence, TMA load copies data from the GPU’s GMEM into a CTA’s SMEM, while TMA store copies data from a CTA’s SMEM to the GPU’s GMEM. We will introduce most of the necessary concepts about TMA. 
+
 #### TMA Load/Store
 TMA load copies data from GMEM into SMEM, while TMA store does the opposite. This copy operation is limited in that only one thread is responsible for issuing the operation, as shown in the code snippet below from the file fmha_blackwell_sm120/collective/sm120_fmha_load_tma_warpspecialized.hpp.
 ```
@@ -171,6 +187,7 @@ tma_store_arrive();
 tma_store_wait<0>();  
 ```
 `tma_store_arrive()` commits the TMA store operation (technically, as a cp.async.bulk-group), and `tma_store_wait<Count>()` waits until at most Count of the committed TMA store operations are still pending (e.g., if all should be completed, set Count to 0).   
+
 #### TMA Load Multicast
 Multicast refers to a situation where we have a tile in a GMEM tensor that we want to copy to multiple SMEM locations in multiple CTAs. This is typically the case in GEMM kernels (i.e., matrix multiplication), where an input matrix column tile is needed for multiple row tiles or vice versa. In such cases, while TMA load is still perfectly functional — we simply provide the same TMA descriptor to the multiple CTAs that need it — the .multicast operand allows us to guarantee L2-cache hits.
 ```
@@ -183,13 +200,16 @@ if (lane_predicate)
 ```
 If a multicast operation is needed, you can replace the parameter 0 in `params.tma_load_q.with(*tma_barrier, 0)` with a uint16 number as a bitmask. This bitmask specifies which CTAs will participate in the TMA multicast load: each bit set to 1 indicates an active CTA. There can be up to 16 CTAs in a cluster (the maximum non-portable size), and the position of each bit corresponds to the CTA ID in cluster.    
 More details about TMA multicast and TMA store reduce are not explained here. They can be found in this [blog](https://research.colfax-intl.com/tutorial-hopper-tma/).
+
 ### Tensor Memory (TMEM)
 A [blog](https://research.colfax-intl.com/cutlass-tutorial-writing-gemm-kernels-using-tensor-memory-for-nvidia-blackwell-gpus/) and [PTX documentation](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tensor-memory-addressing) are recommended for a detailed understanding of TMEM. This section refers to both of them.  
 
 TMEM is introduced by the NVIDIA Blackwell architecture (SM100) and is a dedicated on-chip memory for use by Tensor Cores. Its primary purpose is to replace registers for 5th generation Tensor Core operations by using TMEM instead. The MMA instruction for TMEM is UMMA, which differs from the WGMMA instruction in that it supports low-precision data types, including FP4 and FP6, provides increased throughput across all precisions, and can only be launched by one thread in a CTA. Two adjacent CTAs within an SM cluster, called a CTA pair, can work on UMMA together across two SMs. Even when using two CTAs, only one thread in one CTA launches UMMA.  Obviously, TMEM solves the problem of high register usage when implementing GEMM.  
 
 TMEM is 256KB per SM in size, and is organized 2-dimensionally in 512 columns and 128 rows, or lanes, of 32-bit cells. This inherent 2-D structure is reflected in the 32-bit addresses as well, where bits 31-16 denote the lane ID while 15-0 denote the column. This image from the PTX documentation shows the layout:
+
 ![TMEM_layout](./src_pictures/TMEM_Layout.png)
+
 TMEM is allocated dynamically using the tcgen05.alloc instruction. Furthermore, allocation is in units of columns, so in particular every lane of a column is allocated when a column is allocated. The number of columns allocated must be a power of 2 and at least 32. Finally, TMEM must be explicitly deallocated with tcgen05.dealloc. Both tcgen05.alloc and tcgen05.dealloc must be called from a single warp, and the same warp as far as possible both allocate and deallocate. Generally, we use the high-level to allocate or deallocate memory provided by cutlass.
 ```
 // TMEM object
@@ -232,6 +252,7 @@ Notice that `tmem_allocator.allocate` stores the base 32-bit address of the allo
 Typically, data gets into TMEM via UMMA operations, and is explicitly moved out to registers using tcgen05.ld for post-processing. It’s also possible for threads to manually load data into TMEM, either from SMEM through tcgen05.cp or from registers through tcgen05.st. However, TMEM access patterns for explicit load and store are very restricted. Each warp within a warpgroup can only access 32 lanes (with warp 0 associated to lanes 0-31, warp 1 to lanes 32-63, and so forth). 
 
 Finally, besides UMMA operations and these data movement instructions, no other operations access data from TMEM. In other words, all pre-processing must happen before the data is loaded onto TMEM, and all post-processing must happen after the data is retrieved out of TMEM.
+
 #### UMMA
 UMMA only use TMEM and its low-level is `tcgen05.mma` operation. From the [table of supported matrix shapes](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-kind-shapes), we see that MMA instructions are available in shapes 64 x N x 16 with N a multiple of 8 and 128 x N x 16 with N a multiple of 16, where in both cases N is at most 256. (For all data types, K is expected to be 32 bytes wide for dense GEMM.) Note that the largest UMMA atom, 128 x 256 x 16, is twice as large as the largest WGMMA atom. Its accumulator takes up exactly half of TMEM, meaning that several UMMA atoms can be pipelined without sacrificing performance. 
 In addition, for executing D = A × B + D, UMMA supports limited matrix multiplication in two situations: (1) both matrices A and B use SMEM, and (2) matrix A uses TMEM while matrix B uses SMEM. In both cases, matrix D must use TMEM. These cases can be described by the instructions SM100_MMA_F16BF16_SS and SM100_MMA_F16BF16_TS, for example:
@@ -249,6 +270,7 @@ TiledMMA tiled_mma = make_tiled_mma(SM100_MMA_F16BF16_TS<TypeA, TypeB, TypeC,
                                                          UMMA::Major::K>{});
 ```
 Notice again that UMMA can be launched by only one thread in a CTA.
+
 #### Copy out of TMEM
 Once all the MMAs are done, we need to copy the accumulator results from TMEM to registers. This is done using the PTX tcgen05.ld instruction. CUTLASS abstracts tcgen05.ld as a copy atom, with different variants we saw earlier represented as different copy traits defined in copy atoms found in cute/atom/copy_traits_sm100.hpp. For example, the `SM100_TMEM_LOAD_32dp32b1x` atom describes these details: `32dp` indicates the fully active threads in a warp, `32b` denotes 32 bits for each element, and `1x` indicates the repetition count. More instruction types can be found in the file cute/arch/copy_sm100.hpp. The code snippet below shows the specific definition of the `SM100_TMEM_LOAD_32dp32b1x` atom as an example.
 ```
@@ -307,9 +329,13 @@ make_tmem_copy(Copy_Atom<CopyOp,CopyT> const& atom,
 The `atom_t_layout` in line 312 shows that its shape is `Shape<_32,_4>`, which denotes 32 threads in a warp and 4 warps in a warpgroup.  
 
 As mentioned in the earlier section, certain regions of TMEM are only accessible by a corresponding warp in a warpgroup, based on the warp index mod 4. This [diagram from the PTX manual](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tensorcore-5th-generation-instructions) shows how the data is assigned to warps, and you can find more details there if needed.    
+
 ![TMEM_data_assigned](./src_pictures/TMEM_data_assigned.png)
+
 The pictures below show the TMEM addresses that this maps to.   
+
 ![TMEM_address](./src_pictures/TMEM_address.png)
+
 ### Warp-Specialized Kernel Schedules
 In a block of FMHA, a total of 16 warps are each assigned a specific role, such as Load, MMA, Softmax0, Softmax1, Correction, Epilogue, or Empty. Except for Empty, which is a reserved warp for future use, the other warps carry out specific tasks.
 ```
@@ -353,9 +379,11 @@ struct Sm120FmhaCtxKernelWarpspecializedSchedule
     static const int NumWarps = 16;
   };
 ```
-`WarpRole` is not discussed further here; please refer to the Overview Pipeline section for more information. We will focus on explaining the number of warps assigned to each warp role and their corresponding register counts.   
+`WarpRole` is not discussed further here; please refer to the Overview Pipeline section for more information. We will focus on explaining the number of warps assigned to each warp role and their corresponding register counts. 
+
 #### Warp Assignment
 As the code snippet shows, the MMA, Load, and Epilogue operations each use only one warp. This is because these three operations perform TMA Load, UMMA, and TMA Store, as described in the previous chapter. They are synchronized and must be launched by a single thread in the CTA, so assigning one warp is sufficient. In contrast, the Softmax and Correction operations are post-processing steps for TMEM. It is known that any post-processing operation on TMEM requires 4 warps, or a warp group, which is hardcoded in the `make_tmem_copy` instruction.
+
 #### Register Assignment
 Before discussing register assignment, it is helpful to understand the [Miscellaneous Instructions: setmaxnreg](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=setmaxnreg%2520dec#miscellaneous-instructions-setmaxnreg). The detailed usage in the high-level CUTLASS API is shown below:
 ```
@@ -410,7 +438,8 @@ warpgroup_reg_set()
   }
 }
 ```
-As the code snippet above shows, the constant value 128 is used to determine whether to allocate or deallocate registers. Why 128? Consider that the maximum number of registers per-CTA is 65536, and there are 16 warps in a CTA. Therefore, the average number of registers per thread is 128.   
+As the code snippet above shows, the constant value 128 is used to determine whether to allocate or deallocate registers. Why 128? Consider that the maximum number of registers per-CTA is 65536, and there are 16 warps in a CTA. Therefore, the average number of registers per thread is 128.  
+
 ### Pipeline Creation
 From the above specifications, it is easy to understand why different warp roles are defined and how to set the corresponding parameters. Now, let's return to the Kernel Layer to see what needs to be done. In fact, the file fmha_blackwell_sm120/kernel/sm120_fmha_fwd_kernel_tma_warpsspecialized.hpp clearly shows that the main task of the kernel layer within FMHA is to create a pipeline variable and establish a producer-consumer mechanism between different warp roles. For example:
 ```
@@ -531,8 +560,10 @@ public:
 }
 ```
 Obviously, both `full_barrier_ptr_` and `empty_barrier_ptr_` are arrays in shared memory (SMEM) and work together to maintain synchronization. `empty_barrier_ptr_` records the status of the producer buffer, while `full_barrier_ptr_` records the status of the consumer buffer. When `producer_acquire` is called, it updates the buffer status in the `empty_barrier_ptr_` array at the position specified by the `index_` and `phase_` fields of `PipelineState`. Similarly, the `full_barrier_ptr_` array is updated for the consumer side. For more details, refer to cutlass/pipeline/sm90_pipeline.hpp.
+
 ## Tile Scheduler
 This section will illustrate two tile scheduling strategies: persistent and non-persistent tile schedulers.
+
 ### No-Persistent Tile scheduler
 In a non-persistent tile scheduler, each CTA completes only one tile of computation. For example, `IndividualTileScheduler` is non-persistent in FMHA because its grid shape is set as shown in the following code snippet.
 ```
@@ -547,6 +578,7 @@ static Params to_underlying_arguments(
     return Params{ grid };
 }
 ```
+
 ### Persistent Tile scheduler
 In contrast, the persistent tile scheduler allows each CTA to process multiple work units (tiles), with each work unit's offset being `gridDim.x`. The grid shape is set to the number of SMs if the number of work units exceeds the number of SMs.
 ```
@@ -558,10 +590,296 @@ static dim3 get_grid_shape(Params const& params)
 ```
 In this way, it can mitigate both load imbalance and the **wave quantization** problem.   
 **Wave quantization**   
-When the number of work units exceeds the number of available SMs, the work units are processed in multiple waves. One wave is defined as each available SM completing a single work unit. **Wave quantization** occurs when the number of work units is not evenly divisible by the number of available SMs. For example, consider a case with 10 work units and 4 SMs. The work unit execution timeline would look like:    
-![Wave quantization](./src_pictures/wave_quantization.png)    
+When the number of work units exceeds the number of available SMs, the work units are processed in multiple waves. One wave is defined as each available SM completing a single work unit. **Wave quantization** occurs when the number of work units is not evenly divisible by the number of available SMs. For example, consider a case with 10 work units and 4 SMs. The work unit execution timeline would look like: 
+
+![Wave quantization](./src_pictures/wave_quantization.png)   
+
 In this case, the first two waves are full waves, with every SM being utilized. However, the final wave is a partial wave, where only half of the SMs are occupied.    
 
 However, the persistent tile scheduler can maintain high SM utilization by reducing the idle time that occurs while SMs wait to be assigned new CTAs, thereby mitigating the wave quantization problem. More information about **wave quantization** and additional performance guidance can be found in the blog post [CUTLASS Tutorial: Persistent Kernels and Stream-K](https://research.colfax-intl.com/cutlass-tutorial-persistent-kernels-and-stream-k/) and the [NVIDIA Deep Learning Performance Guide](https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#math-mem).
+
 # Collective Layer
-Updating... ... ...
+Welcome to the last section. In this section, we will focus on practical code implementation, including how to use TMA, TMEM, UMMA, and more, based on specific code examples. However, before discussing the collective layer, we should learn about a core library named CUTE, which solves the complex problem of mapping the logical positions of loading, storing, and computing data to the actual physical addresses and vice versa. After that, we will begin to discuss the code details of how to implement the collective layer.
+
+## CUTE
+This section is organized into three main parts: the first covers **Tensor**, the second covers **Copy Abstraction**, and the third covers **MMA Abstraction**. These parts describe data types, data transfer, and data computation, respectively.
+
+### Tensor
+This data type was introduced in CUTLASS 3.0. We will refer to its structure and related algebraic operations. Since there is an abundance of content, we will not cover every detail, but instead focus on the most important and commonly used aspects. For more information, you can refer to the [documentation](https://docs.nvidia.com/cutlass/media/docs/cpp/cute/index.html).
+
+#### Tensor Structure
+A `Tensor` consists of an `Engine` and a `Layout`, which together abstract away the details of how the array’s elements are organized and stored. In this way, tensors of different shapes can be represented, while sharing a common memory address. 
+
+**Engine**    
+The `Engine`, which represents the storage, includes information such as the memory address, data type, and other details essential for physical memory access. According to the official documentation, the `Engine` concept is a wrapper for an iterator or an array of data. It uses a simplified interface similar to `std::array` to provide iterator functionality.
+```
+using iterator     =  // The iterator type
+using value_type   =  // The iterator value-type
+using reference    =  // The iterator reference-type
+iterator begin()      // The iterator
+```
+In general, users do not need to construct `Engine` on their own. When a Tensor is constructed, the appropriate engine – often `ArrayEngine<T,N>`, `ViewEngine<Iter>`, or `ConstViewEngine<Iter>` – will be constructed.   
+
+**Layout**   
+The `Layout` defines the data organization, described by the shape and stride of a multidimensional array, as shown below. It is worth mentioning that the essence of a Layout is a function that maps a multi-dimensional logical memory address to a one-dimensional address. This mapping function is reversible, meaning it has a right inverse, while the `Layout` itself is referred to as the left inverse.
+```
+cute::Layout<
+    cute::tuple<cute::tuple<cute::C<128>, cute::C<16>>, cute::_1, cute::tuple<cute::_4, cute::_2>, cute::_2>,           // shape
+    cute::tuple<cute::tuple<cute::_64, cute::_1>, cute::_0, cute::tuple<cute::C<16>, cute::C<8192>>, cute::_16384>      // stride
+    >
+```
+And here are some examples of creating a Layout from the Nvidia CUTE documentation. More examples can be found on this [webpage](https://docs.nvidia.com/cutlass/media/docs/cpp/cute/01_layout.html).
+```
+Layout s8 = make_layout(Int<8>{});
+Layout d8 = make_layout(8);
+
+Layout s2xd4_a = make_layout(make_shape (Int< 2>{},4),
+                             make_stride(Int<12>{},Int<1>{}));
+Layout s2xd4_col = make_layout(make_shape(Int<2>{},4),
+                               LayoutLeft{});
+Layout s2xd4_row = make_layout(make_shape(Int<2>{},4),
+                               LayoutRight{});
+
+Layout s2xh4 = make_layout(make_shape (2,make_shape (2,2)),
+                           make_stride(4,make_stride(2,1)));
+```
+The results of the above examples are as follows:
+```
+s8        :  _8:_1
+d8        :  8:_1
+
+s2xd4_a   :  (_2,4):(_12,_1)
+s2xd4_col :  (_2,4):(_1,_2)
+s2xd4_row :  (_2,4):(4,_1)
+
+s2xh4     :  (2,(2,2)):(4,(2,1))
+```
+After learning how to create a `Layout`, we will introduce some common layout manipulation techniques that are widely used throughout CUTE. The following examples are also taken from the official documentation.    
+**Sublayouts**    
+`layout<I...>`
+```
+Layout a   = Layout<Shape<_4,Shape<_3,_6>>>{}; // (4,(3,6)):(1,(4,12))
+Layout a0  = layout<0>(a);                     // 4:1
+Layout a1  = layout<1>(a);                     // (3,6):(4,12)
+Layout a10 = layout<1,0>(a);                   // 3:4
+Layout a11 = layout<1,1>(a);                   // 6:12
+```
+`select<I...>`
+```
+Layout a   = Layout<Shape<_2,_3,_5,_7>>{};     // (2,3,5,7):(1,2,6,30)
+Layout a13 = select<1,3>(a);                   // (3,7):(2,30)
+Layout a01 = select<0,1,3>(a);                 // (2,3,7):(1,2,30)
+Layout a2  = select<2>(a);                     // (5):(6)
+```
+`take<ModeBegin, ModeEnd>`
+```
+Layout a   = Layout<Shape<_2,_3,_5,_7>>{};     // (2,3,5,7):(1,2,6,30)
+Layout a13 = take<1,3>(a);                     // (3,5):(2,6)
+Layout a14 = take<1,4>(a);                     // (3,5,7):(2,6,30)
+// take<1,1> not allowed. Empty layouts not allowed.
+```
+**Concatenation**   
+By `make_layout`
+```
+Layout a = Layout<_3,_1>{};                     // 3:1
+Layout b = Layout<_4,_3>{};                     // 4:3
+Layout row = make_layout(a, b);                 // (3,4):(1,3)
+Layout col = make_layout(b, a);                 // (4,3):(3,1)
+Layout q   = make_layout(row, col);             // ((3,4),(4,3)):((1,3),(3,1))
+Layout aa  = make_layout(a);                    // (3):(1)
+Layout aaa = make_layout(aa);                   // ((3)):((1))
+Layout d   = make_layout(a, make_layout(a), a); // (3,(3),3):(1,(1),1)
+```
+or `append`, `prepend`, `replace`.
+```
+Layout a = Layout<_3,_1>{};                     // 3:1
+Layout b = Layout<_4,_3>{};                     // 4:3
+Layout ab = append(a, b);                       // (3,4):(1,3)
+Layout ba = prepend(a, b);                      // (4,3):(3,1)
+Layout c  = append(ab, ab);                     // (3,4,(3,4)):(1,3,(1,3))
+Layout d  = replace<2>(c, b);                   // (3,4,4):(1,3,3)
+```
+**Grouping and flattening**   
+`group<ModeBegin, ModeEnd>`
+```
+Layout a = Layout<Shape<_2,_3,_5,_7>>{};  // (_2,_3,_5,_7):(_1,_2,_6,_30)
+Layout b = group<0,2>(a);                 // ((_2,_3),_5,_7):((_1,_2),_6,_30)
+Layout c = group<1,3>(b);                 // ((_2,_3),(_5,_7)):((_1,_2),(_6,_30))
+```
+`flatten`
+```
+Layout f = flatten(b);                    // (_2,_3,_5,_7):(_1,_2,_6,_30)
+Layout e = flatten(c);                    // (_2,_3,_5,_7):(_1,_2,_6,_30)
+```
+`Slice`
+```
+// ((_3,2),(2,_5,_2)):((4,1),(_2,13,100))
+Tensor A = make_tensor(ptr, make_shape (make_shape (Int<3>{},2), make_shape (       2,Int<5>{},Int<2>{})),
+                            make_stride(make_stride(       4,1), make_stride(Int<2>{},      13,     100)));
+
+// ((2,_5,_2)):((_2,13,100))
+Tensor B = A(2,_);
+
+// ((_3,_2)):((4,1))
+Tensor C = A(_,5);
+
+// (_3,2):(4,1)
+Tensor D = A(make_coord(_,_),5);
+
+// (_3,_5):(4,13)
+Tensor E = A(make_coord(_,1),make_coord(0,_,1));
+
+// (2,2,_2):(1,_2,100)
+Tensor F = A(make_coord(2,_),make_coord(_,3,_));
+```
+The results are shown in the picture below, taken from the [CUTE documentation](https://docs.nvidia.com/cutlass/media/docs/cpp/cute/03_tensor.html)   
+
+![slicing results](./src_pictures/slicing_introduction.png)    
+
+These are the main layout manipulation techniques. Such manipulation techniques are also well-suited to `Tensor` objects, as operating on a tensor fundamentally means operating on its layout.   
+
+After demonstrating the composition of the Tensor structure, we will return to the `Tensor` itself to discuss its creation and other operations. There are also fundamental operations, such as `size`, `rank`, `depth`, and more，which will not be discussed here. For additional details, please refer to the [documention](https://docs.nvidia.com/cutlass/media/docs/cpp/cute/03_tensor.html).
+
+**Tensor Creation**   
+There are two types of tensors: non-owning `Tensor` and owning `Tensor`. The fundamental difference between them is whether the `Tensor Engine` owns its own physical memory. A non-owning `Tensor` is typically used to describe an alternative layout for existing physical memory, and can be created as follows:
+```
+float* A = ...;
+
+// Untagged pointers
+Tensor tensor_8   = make_tensor(A, make_layout(Int<8>{}));  // Construct with Layout
+Tensor tensor_8s  = make_tensor(A, Int<8>{});               // Construct with Shape
+Tensor tensor_8d2 = make_tensor(A, 8, 2);                   // Construct with Shape and Stride
+
+// Global memory (static or dynamic layouts)
+Tensor gmem_8s     = make_tensor(make_gmem_ptr(A), Int<8>{});
+Tensor gmem_8d     = make_tensor(make_gmem_ptr(A), 8);
+Tensor gmem_8sx16d = make_tensor(make_gmem_ptr(A), make_shape(Int<8>{},16));
+Tensor gmem_8dx16s = make_tensor(make_gmem_ptr(A), make_shape (      8  ,Int<16>{}),
+                                                   make_stride(Int<16>{},Int< 1>{}));
+
+// Shared memory (static or dynamic layouts)
+Layout smem_layout = make_layout(make_shape(Int<4>{},Int<8>{}));
+__shared__ float smem[decltype(cosize(smem_layout))::value];   // (static-only allocation)
+Tensor smem_4x8_col = make_tensor(make_smem_ptr(smem), smem_layout);
+Tensor smem_4x8_row = make_tensor(make_smem_ptr(smem), shape(smem_layout), LayoutRight{});
+```
+```
+tensor_8     : ptr[32b](0x7f42efc00000) o _8:_1
+tensor_8s    : ptr[32b](0x7f42efc00000) o _8:_1
+tensor_8d2   : ptr[32b](0x7f42efc00000) o 8:2
+gmem_8s      : gmem_ptr[32b](0x7f42efc00000) o _8:_1
+gmem_8d      : gmem_ptr[32b](0x7f42efc00000) o 8:_1
+gmem_8sx16d  : gmem_ptr[32b](0x7f42efc00000) o (_8,16):(_1,_8)
+gmem_8dx16s  : gmem_ptr[32b](0x7f42efc00000) o (8,_16):(_16,_1)
+smem_4x8_col : smem_ptr[32b](0x7f4316000000) o (_4,_8):(_1,_4)
+smem_4x8_row : smem_ptr[32b](0x7f4316000000) o (_4,_8):(_8,_1)
+```
+The examples of creating an owning Tensor are shown below:
+```
+// Register memory (static layouts only)
+Tensor rmem_4x8_col = make_tensor<float>(Shape<_4,_8>{});
+Tensor rmem_4x8_row = make_tensor<float>(Shape<_4,_8>{},
+                                         LayoutRight{});
+Tensor rmem_4x8_pad = make_tensor<float>(Shape <_4, _8>{},
+                                         Stride<_32,_2>{});
+Tensor rmem_4x8_like = make_tensor_like(rmem_4x8_pad);
+```
+```
+rmem_4x8_col  : ptr[32b](0x7fff48929460) o (_4,_8):(_1,_4)
+rmem_4x8_row  : ptr[32b](0x7fff489294e0) o (_4,_8):(_8,_1)
+rmem_4x8_pad  : ptr[32b](0x7fff489295e0) o (_4,_8):(_32,_2)
+rmem_4x8_like : ptr[32b](0x7fff48929560) o (_4,_8):(_8,_1)
+``` 
+In general, when creating an owning `Tensor`, `make_tensor` or `make_tensor_like` will allocate a contiguous memory array internally.
+
+#### Algebraic Operations
+The called algebraic operations actually is an algebra of `Layout`, the `Tensor` don't exist algebraic operations. There are three fundamental and core operations: `coalesce`, `composition`and `complement`. We will not extend to discuss them. On the one hand, they are detailly demenstrated by the [office documentation](https://docs.nvidia.com/cutlass/media/docs/cpp/cute/02_layout_algebra.html). On the another hand, it is sorry that the auther don't explain them. Specially. we should mention that `composition` is extremly helpful when two different layout `Tensor` using a common physical memory. It means that many different operations, likes `MMA` or `Copy`, which require different layout `Tensor`, also are supported.
+
+The so-called algebraic operations are actually operations on the `Layout`; the `Tensor` itself does not own algebraic operations. There are three fundamental operations: `coalesce`, `composition`, and `complement`. We will not discuss them in detail here. On one hand, they are thoroughly demonstrated in the [official documentation](https://docs.nvidia.com/cutlass/media/docs/cpp/cute/02_layout_algebra.html). On the other hand, the author is unsure how to further explain these operations. In particular, it is worth mentioning that `composition` is extremely helpful when two tensors with different layouts share the same physical memory. For instance, when we need to use the same data to perform different operations that require different layouts from the current `Tensor`, we can create a new `Layout` and compose it with the current `Tensor`. This allows us to obtain a new layout `Tensor` without allocating additional memory. In addition, we can easily switch between different layouts as needed.
+```
+// for tensor
+typename CollectiveMmaQK::TiledMma mma_qk;
+
+Tensor tScS = mma_qk.get_slice(0).partition_C(cS);
+Tensor tStS = partition_fragment_C(mma_qk, select<0,1>(TileShapeQK{}));
+
+Tensor tStS_v = tStS.compose(make_layout(make_shape(_128{}, _2{})));
+Tensor tScS_v = tScS.compose(make_layout(make_shape(_128{}, _2{})));
+```
+```
+// for layout
+template<class Layout, class Stages = _1>
+CUTE_DEVICE 
+constexpr auto 
+unstageSmemLayout(Layout const& layout, Stages stages = {}) 
+{
+  return composition(layout, prepend<decltype(rank(layout))::value>(make_layout(stages), _));
+}
+```
+Note that the use of `composition` has certain requirements, which are explained in detail in the official documentation.   
+
+Next, let's look at the operations: product and divide. These are also `Layout` operations, just like those discussed above. We will briefly discuss them here, as the [official documentation](https://docs.nvidia.com/cutlass/media/docs/cpp/cute/02_layout_algebra.html) provides detailed examples.    
+**Product**
+The product of a `Layout` is conceptually similar to ordinary multiplication of real numbers, representing repeated instances of a variable. Informally, there are two types of product operations: 1-D and 2-D. The 1-D operations include `logical_product`, `zipped_product`, `tiled_product`, and `flat_product`. The 2-D operations involve `blocked_product` and `raked_product`. If you are familiar with the official CUTE documentation, you may notice that this classification is not strictly accurate, but it is practical and useful for understanding. The official documentation explains `blocked_product` and `raked_product` in detail, but the author is currently not familiar with them, so they will not be discussed further here. Next, we will demonstrate the essence of the 1-D operations using `logical_product` as an example. The definition of `logical_product` is shown below.
+```
+template <class LShape, class LStride,
+          class TShape, class TStride>
+auto logical_product(Layout<LShape,LStride> const& layout,
+                     Layout<TShape,TStride> const& tiler)
+{
+  return make_layout(layout, composition(complement(layout, size(layout)*cosize(tiler)), tiler));
+}
+```
+
+![logical_product](./src_pictures/logical_product.png)
+
+The above figure demonstrates that `size(B)` is the number of repetitions for `Tensor A`. In fact, it can also be viewed as a product between `A = (2,2):(4,1)` and `B = 6:1`. This is because `Tensor B` can be considered as the complement of `Tensor A`, which requires  the `stride` to be monotonically increasing.
+
+The following lists the result formats of all common operations:  
+```
+Layout Shape : (M, N, L, ...)
+Tiler Shape  : <TileM, TileN>
+
+logical_product : ((M,TileM), (N,TileN), L, ...)
+zipped_product  : ((M,N), (TileM,TileN,L,...))
+tiled_product   : ((M,N), TileM, TileN, L, ...)
+flat_product    : (M, N, TileM, TileN, L, ...)
+```
+
+**Division**
+The operation division is different with division of real numbers. the division of `Loyout` indicates a hierarchical division, such as `6 / 2 = (2, 3)`. Similar to product, division can also be classified strictly into two categories of 1-D and 2-D. We will also just talk about `layout_divide ` operation. The definition is shown below.   
+```
+template <class LShape, class LStride,
+          class TShape, class TStride>
+auto logical_divide(Layout<LShape,LStride> const& layout,
+                    Layout<TShape,TStride> const& tiler)
+{
+  return composition(layout, make_layout(tiler, complement(tiler, size(layout))));
+}
+```
+
+![logical_division](./src_pictures/logical_division.png)
+
+The above figure illustrates the result of `layout_divide`. Note that `Tensor C` is processed using `coalesce`. The following lists the result formats of all common operations:    
+```
+Layout Shape : (M, N, L, ...)
+Tiler Shape  : <TileM, TileN>
+
+logical_divide : ((TileM,RestM), (TileN,RestN), L, ...)
+zipped_divide  : ((TileM,TileN), (RestM,RestN,L,...))
+tiled_divide   : ((TileM,TileN), RestM, RestN, L, ...)
+flat_divide    : (TileM, TileN, RestM, RestN, L, ...)
+```
+
+Finally, it is worth mentioning that there are also some fundamental operations: `inner_partition(Tensor, Tiler, Coord)` and `outer_partition(Tensor, Tiler, Coord)`. Specifically, `local_tile(Tensor, Tiler, Coord)` corresponds to the former, while `local_partition(Tensor, Layout, Idx)` corresponds to the latter. More details can be found in the [Partition a Tensor documentation](https://docs.nvidia.com/cutlass/media/docs/cpp/cute/03_tensor.html#partitioning-a-tensor). Here, only the result diagrams are provided.  
+
+***local_tile(Tensor, Tiler, Coord)***           
+![local_tile](./src_pictures/local_tile.png)    
+
+***local_partition(Tensor, Layout, Idx)***             
+![local_partition](./src_pictures/local_partition.png)    
+
+In addition, for more information about tensor algorithms, refer to the [CuTe Tensor algorithms](https://docs.nvidia.com/cutlass/media/docs/cpp/cute/04_algorithms.html)
+
+### Copy Abstract
+Updating ... ... ...
