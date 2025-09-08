@@ -96,7 +96,7 @@ else
 }
 ```
 
-### Cluster
+## Cluster
 Cluster launch is supported in Hopper and Blackwell architectures, and one of its abilities is to provide a multi-broadcast function. Multi-broadcast can broadcast data to different blocks within the same cluster when those blocks need the same tiled data, which can significantly reduce memory access time.
 ```
 // Shape of the threadblocks in a cluster
@@ -602,7 +602,7 @@ However, the persistent tile scheduler can maintain high SM utilization by reduc
 Welcome to the last section. In this section, we will focus on practical code implementation, including how to use TMA, TMEM, UMMA, and more, based on specific code examples. However, before discussing the collective layer, we should learn about a core library named CUTE, which solves the complex problem of mapping the logical positions of loading, storing, and computing data to the actual physical addresses and vice versa. After that, we will begin to discuss the code details of how to implement the collective layer.
 
 ## CUTE
-This section is organized into three main parts: the first covers **Tensor**, the second covers **Copy Abstraction**, and the third covers **MMA Abstraction**. These parts describe data types, data transfer, and data computation, respectively.
+This section is organized into four main parts: the first covers **Tensor**, the second covers **Copy Abstraction**, the third covers **MMA Abstraction**, and the fourth covers **Swizzle**. These parts correspond to data types, data transfer, data computation, and high-performance shared memory data layout, respectively.
 
 ### Tensor
 This data type was introduced in CUTLASS 3.0. We will refer to its structure and related algebraic operations. Since there is an abundance of content, we will not cover every detail, but instead focus on the most important and commonly used aspects. For more information, you can refer to the [documentation](https://docs.nvidia.com/cutlass/media/docs/cpp/cute/index.html).
@@ -882,4 +882,404 @@ Finally, it is worth mentioning that there are also some fundamental operations:
 In addition, for more information about tensor algorithms, refer to the [CuTe Tensor algorithms](https://docs.nvidia.com/cutlass/media/docs/cpp/cute/04_algorithms.html)
 
 ### Copy Abstract
+The copy abstraction is a core component, including `cute::copy()`, `CopyOperation`, `Copy_Traits`, `Copy_Atom`, `TiledCopy`, and `ThrCopy`. We will introduce each of these constructs in detail.    
+
+#### cute::copy()
+`cute::copy()` is the top-level universal interface for performing data load and store operations. It is worth noting that moving a tile of data from the source address to the destination address typically requires repeated execution of the `Copy_Atom` operation. The following code snippet from cute/algorithm/copy.hpp demonstrates this:  
+```
+template <class... CopyArgs,
+          class SrcEngine, class SrcLayout,
+          class DstEngine, class DstLayout>
+CUTE_HOST_DEVICE
+void
+copy(Copy_Atom<CopyArgs...>       const& copy_atom,
+     Tensor<SrcEngine, SrcLayout> const& src,       // (V,Rest...)
+     Tensor<DstEngine, DstLayout>      & dst)       // (V,Rest...)
+{
+  if constexpr (SrcLayout::rank == 1) {   // Dispatch the copy
+    copy_atom.call(src, dst);
+  } else {                                // Loop over all but the first mode
+    constexpr int R = SrcLayout::rank;
+    Tensor src_v = group_modes<1,R>(src);
+    Tensor dst_v = group_modes<1,R>(dst);
+
+    if constexpr (is_static<decltype(shape(src_v))>::value && is_static<decltype(shape(dst_v))>::value) {
+      CUTE_STATIC_ASSERT_V(size<1>(src_v) == size<1>(dst_v));
+
+      // AutoFilter on the Rest-mode
+      auto dst_null = nullspace(layout<1>(dst_v));
+
+      Tensor dst_n = zipped_divide(dst_v, make_tile(shape<0>(dst_v), dst_null));  // ((V, NLL), (_1, Rest))
+      Tensor src_n = zipped_divide(src_v, make_tile(shape<0>(src_v), dst_null));  // ((V, NLL), (_1, Rest))
+
+      CUTE_STATIC_ASSERT_V(size<1>(src_n) == size<1>(dst_n));
+      CUTE_STATIC_ASSERT_V((cosize<0,1>(dst_n.layout()) == Int<1>{}), "Nullspace definition error");
+      CUTE_STATIC_ASSERT_V((cosize<0,1>(src_n.layout()) == Int<1>{}), "Error: Ambiguous scatter detected in copy");
+      CUTE_STATIC_ASSERT_V((size<1,0>(dst_n) == Int<1>{}));
+      CUTE_STATIC_ASSERT_V((size<1,0>(src_n) == Int<1>{}));
+
+      Tensor dst_c = dst_n(make_coord(_,Int<0>{}),make_coord(Int<0>{},_));        // (V, Rest)
+      Tensor src_c = src_n(make_coord(_,Int<0>{}),make_coord(Int<0>{},_));        // (V, Rest)
+
+      CUTE_STATIC_ASSERT_V( size<1>(src_c) ==  size<1>(dst_c));
+      CUTE_STATIC_ASSERT_V(shape<0>(dst_c) == shape<0>(dst));
+      CUTE_STATIC_ASSERT_V(shape<0>(src_c) == shape<0>(src));
+
+      CUTE_UNROLL
+      for (int i = 0; i < size<1>(dst_c); ++i) {
+        copy_atom.call(src_c(_,i), dst_c(_,i));
+      }
+    } else {
+      CUTE_UNROLL
+      for (int i = 0; i < size<1>(dst_v); ++i) {
+        copy_atom.call(src_v(_,i), dst_v(_,i));
+      }
+    }
+  }
+}
+```
+The for loop indicates that the data of a tile in a CTA generally needs to be copied repeatedly, even though we only call `cute::copy()` once within the kernel.
+
+#### CopyOperation
+After introducing `cute::copy`, we should discuss `Copy_Atom`. However, we will first explain `CopyOperation`, since it is the core component of `Copy_Atom` and should be introduced before. `CopyOperation` is essentially the execution instruction for `Copy_Atom`, encapsulating the relevant PTX instructions. For example, as shown in the following example from cute/arch/copy_sm100_tma.hpp:
+```
+struct SM100_TMA_2SM_LOAD_MULTICAST_2D
+{
+  CUTE_HOST_DEVICE static void
+  copy(void const* desc_ptr, uint64_t* mbar_ptr, uint16_t multicast_mask, uint64_t cache_hint,
+       void      * smem_ptr,
+       int32_t const& crd0, int32_t const& crd1)
+  {
+#if defined(CUTE_ARCH_TMA_SM100_ENABLED)
+    uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+    // Executed by both CTAs. Set peer bit to 0 so that the
+    // transaction bytes will update CTA0's barrier.
+    uint32_t smem_int_mbar = cast_smem_ptr_to_uint(mbar_ptr) & Sm100MmaPeerBitMask;
+    uint32_t smem_int_ptr  = cast_smem_ptr_to_uint(smem_ptr);
+    asm volatile (
+      "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
+      " [%0], [%1, {%4, %5}], [%2], %3, %6;"
+      :
+      : "r"(smem_int_ptr), "l"(gmem_int_desc), "r"(smem_int_mbar), "h"(multicast_mask),
+        "r"(crd0), "r"(crd1), "l"(cache_hint)
+      : "memory");
+#else
+    CUTE_INVALID_CONTROL_PATH("Trying to use tma without CUTE_ARCH_TMA_SM100_ENABLED.");
+#endif
+  }
+};
+```
+
+#### Copy_Traits
+Next, we also see another core component of `Copy_Atom`, which is `Copy_Traits`. `Copy_Traits` can be seen as providing more detailed and essential information to `Copy_Atom`, but this information does not need to be managed by users. It includes the TMA descriptor `TmaDescriptor`, other auxiliary parameters, and necessary method functions. The details are omitted here for brevity. It is recommended to read various files related to `Copy_Traits`, such as cute/atom/copy_traits_sm100_tma.hpp and others.    
+
+#### Copy_Atom
+`Copy_Atom` is a basic atomic operation that can be executed by one or multiple threads within a warp. Typically, only one thread is responsible for the `TMA` operation. It serves as the implementation entry point for the copy operation. The relevant code can be found in cute/atom/copy_atom.hpp.
+
+#### TiledCopy
+`TiledCopy` encapsulates one or multiple `Copy_Atom` operations, describing how a tile of data in a CTA is organized by `Copy_Atom` operations. Its shape can be simply understood as having two modes: one represents the data layout for a single `Copy_Atom`, and the other indicates the number of repetitions. It provides methods to allocate a tile of data in a CTA to each thread shape, but these methods are not exposed to users here. The relevant code can be found in cute/atom/copy_atom.hpp. 
+
+#### ThrCopy
+`ThrCopy` is the thread-level operation, indicating how to map each thread's register fragment data to the tiled data of a CTA. It provides the user interface to partition a tile of data to a single thread. For example:
+```
+template <class STensor>
+CUTE_HOST_DEVICE
+auto
+partition_S(STensor&& stensor) const {
+  //static_assert(sizeof(typename remove_cvref_t<STensor>::value_type) == sizeof(typename TiledCopy::ValType),
+  //              "Expected ValType for tiling SrcTensor.");
+  auto thr_tensor = make_tensor(static_cast<STensor&&>(stensor).data(), TiledCopy::tidfrg_S(stensor.layout()));
+  return thr_tensor(thr_idx_, _, repeat<rank_v<STensor>>(_));
+}
+
+template <class DTensor>
+CUTE_HOST_DEVICE
+auto
+partition_D(DTensor&& dtensor) const {
+  //static_assert(sizeof(typename remove_cvref_t<DTensor>::value_type) == sizeof(typename TiledCopy::ValType),
+  //              "Expected ValType for tiling DstTensor.");
+  auto thr_tensor = make_tensor(static_cast<DTensor&&>(dtensor).data(), TiledCopy::tidfrg_D(dtensor.layout()));
+  return thr_tensor(thr_idx_, _, repeat<rank_v<DTensor>>(_));
+}
+```
+Notice that `partition_S` is used for the source address, while `partition_D` is used for the destination address.
+
+### MMA Abstract
+In this section, we will focus on another core concept in CUTE: the MMA abstraction. It includes the following components: `cute::gemm()`, `MMAOperation`, `MMA_Traits`, `MMA_Atom`, `TiledMMA`, and `ThrMMA`.
+
+#### cute::gemm()
+`cute::gemm()` is the top-level universal interface for performing matrix multiplication and addition operations. However, it differs from `cute::copy()`, which requires users to write a for loop. For example:
+```
+template<typename Atom, typename TA, typename TB, typename TC>
+CUTE_DEVICE void 
+gemm_reset_zero_acc(Atom& atom, TA const& tA, TB const& tB, TC&& tC) 
+{
+  constexpr int rA = decltype(rank(tA))::value;
+  constexpr int rB = decltype(rank(tB))::value;
+  constexpr int rC = decltype(rank(tC))::value;
+  static_assert(rA == 3 && rB == 3 && rC == 3);
+
+  CUTLASS_PRAGMA_UNROLL
+  for (int k_block = 0; k_block < size<2>(tA); k_block++)
+  {
+    cute::gemm(atom, tA(_,_,k_block), tB(_,_,k_block), tC);
+    atom.accumulate_ = decltype(atom.accumulate_)::One;
+  }
+}
+```
+Note that whether to continue accumulating the output `Tensor C` is determined by the user by setting the `atom.accumulate_` flag: a value of one indicates continuous accumulation, while zero indicates a reset. Typically, accumulation is performed along the K-dimension to improve the L2-cache hit rate of TMA loads from global memory.
+
+#### MMAOperation
+`MMAOperation` is a practical execution instruction that describes how to perform matrix multiplication and addition operations.
+```
+template <class a_type, class b_type, class c_type,
+          int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          UMMA::ScaleIn a_neg = UMMA::ScaleIn::One, UMMA::ScaleIn b_neg = UMMA::ScaleIn::One>
+struct SM100_MMA_F16BF16_SS
+{
+  static_assert(M == 64 || M == 128, "SM100_MMA_F16BF16 M-mode size should be 64 or 128 for 1 CTA cluster MMA.");
+  static_assert((M == 64  && (N % 8 == 0)  && (8 <= N)  && (N <= 256)) ||
+                (M == 128 && (N % 16 == 0) && (16 <= N) && (N <= 256)),
+                "SM100_MMA_F16BF16 N-mode size should be a multiple of 8 between 8 and 256 for M=64,\
+                 or a multiple of 16 between 16 and 256 for M=128.");
+
+  using DRegisters = void;
+  using ARegisters = uint64_t[1];
+  using BRegisters = uint64_t[1];
+  using CRegisters = uint32_t[1];
+
+  CUTE_HOST_DEVICE static void
+  fma(uint64_t const& desc_a,
+      uint64_t const& desc_b,
+      uint32_t const& tmem_c,
+      uint32_t const& scaleC,
+      uint64_t const& idescE)
+  {
+#if defined(CUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED)
+    if (cute::elect_one_sync()) {
+      uint32_t mask[4] = {0, 0, 0, 0};
+      asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%5, %6, %7, %8}, p; \n\t"
+        "}\n"
+        :
+        : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(uint32_t(idescE>>32)), "r"(scaleC),
+          "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3]));
+    }
+#else
+    CUTE_INVALID_CONTROL_PATH("Attempting to use SM100_MMA_F16BF16_SS without CUTE_ARCH_MMA_SM100A_ENABLED");
+#endif
+  }
+};
+```
+Finally, a brief note on the anatomy of the atom name.  `SM100_MMA_F16BF16_SS` can be deconstructed into the following parts.
+
+`SM100_MMA`: specifies the instruction. Simply, the UMMA instruction for sm100.   
+`F16BF16`: specifies the accepted input types for A and B. In this case, either fp16 or bf16. Note that this maps onto the `.kind` qualifier for `tcgen05.mma` (e.g., `.kind::f16`), while the exact input type is recorded by the [instruction descriptor](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instuction-desc-kind-tf32-f16-f8f6f4).    
+`SS`: specifies memory location for A and B. `SS` is for both being in SMEM, while `TS` is for A being in TMEM and B in SMEM.   
+Suffix: There are additional suffixes for more complex cases, such as block scaling or 2-SM UMMA.
+
+#### MMA_Traits
+`MMA_Traits` also provides essential details required for the `MMA_Atom` operation, although users do not need to manage this information directly. In particular, layout information is so important that it must be specified separately. For example:
+```
+//////////////////////////////////////////////////
+// Common layouts for UMMA Shared Memory //
+//////////////////////////////////////////////////
+
+using cute::GMMA::Layout_MN_INTER_Atom;
+using cute::GMMA::Layout_MN_SW32_Atom;
+using cute::GMMA::Layout_MN_SW64_Atom;
+using cute::GMMA::Layout_MN_SW128_Atom;
+using cute::GMMA::Layout_K_INTER_Atom;
+using cute::GMMA::Layout_K_SW32_Atom;
+using cute::GMMA::Layout_K_SW64_Atom;
+using cute::GMMA::Layout_K_SW128_Atom;
+
+using Layout_MN_SW128_32B_Atom_Bits = ComposedLayout<Swizzle<2,5,2>, smem_ptr_flag, Layout<Shape< _1024,_4>,Stride<_1, _1024>>>;
+
+template <class Type>
+using Layout_MN_SW128_32B_Atom = decltype(upcast<sizeof_bits<Type>::value>(Layout_MN_SW128_32B_Atom_Bits{}));
+```
+```
+///////////////////////////////////////////
+// Common layouts for GMMA Shared Memory //
+///////////////////////////////////////////
+
+// M|N-major GMMA layouts in units of bits
+using Layout_MN_INTER_Atom_Bits = ComposedLayout<Swizzle<0,4,3>, smem_ptr_flag, Layout<Shape< _128,_8>,Stride<_1, _128>>>;
+using Layout_MN_SW32_Atom_Bits  = ComposedLayout<Swizzle<1,4,3>, smem_ptr_flag, Layout<Shape< _256,_8>,Stride<_1, _256>>>;
+using Layout_MN_SW64_Atom_Bits  = ComposedLayout<Swizzle<2,4,3>, smem_ptr_flag, Layout<Shape< _512,_8>,Stride<_1, _512>>>;
+using Layout_MN_SW128_Atom_Bits = ComposedLayout<Swizzle<3,4,3>, smem_ptr_flag, Layout<Shape<_1024,_8>,Stride<_1,_1024>>>;
+
+// K-major GMMA layouts in units of bits
+using Layout_K_INTER_Atom_Bits  = ComposedLayout<Swizzle<0,4,3>, smem_ptr_flag, Layout<Shape<_8, _128>,Stride< _128,_1>>>;
+using Layout_K_SW32_Atom_Bits   = ComposedLayout<Swizzle<1,4,3>, smem_ptr_flag, Layout<Shape<_8, _256>,Stride< _256,_1>>>;
+using Layout_K_SW64_Atom_Bits   = ComposedLayout<Swizzle<2,4,3>, smem_ptr_flag, Layout<Shape<_8, _512>,Stride< _512,_1>>>;
+using Layout_K_SW128_Atom_Bits  = ComposedLayout<Swizzle<3,4,3>, smem_ptr_flag, Layout<Shape<_8,_1024>,Stride<_1024,_1>>>;
+
+// M|N-major layouts in units of Type
+template <class Type>
+using Layout_MN_INTER_Atom = decltype(upcast<sizeof_bits<Type>::value>(Layout_MN_INTER_Atom_Bits{}));
+template <class Type>
+using Layout_MN_SW32_Atom  = decltype(upcast<sizeof_bits<Type>::value>(Layout_MN_SW32_Atom_Bits{}));
+template <class Type>
+using Layout_MN_SW64_Atom  = decltype(upcast<sizeof_bits<Type>::value>(Layout_MN_SW64_Atom_Bits{}));
+template <class Type>
+using Layout_MN_SW128_Atom = decltype(upcast<sizeof_bits<Type>::value>(Layout_MN_SW128_Atom_Bits{}));
+
+// K-major layouts in units of Type
+template <class Type>
+using Layout_K_INTER_Atom = decltype(upcast<sizeof_bits<Type>::value>(Layout_K_INTER_Atom_Bits{}));
+template <class Type>
+using Layout_K_SW32_Atom  = decltype(upcast<sizeof_bits<Type>::value>(Layout_K_SW32_Atom_Bits{}));
+template <class Type>
+using Layout_K_SW64_Atom  = decltype(upcast<sizeof_bits<Type>::value>(Layout_K_SW64_Atom_Bits{}));
+template <class Type>
+using Layout_K_SW128_Atom = decltype(upcast<sizeof_bits<Type>::value>(Layout_K_SW128_Atom_Bits{}));
+```
+The above code snippet shows that an atomic MMA operation must specify the data size. It also explains how the shared memory layout is organized for a single MMA_Atom operation. For further details, see cute/atom/mma_traits_sm100.hpp and cute/atom/mma_traits_sm90_gmma.hpp.
+
+#### MMA_Atom
+`MMA_Atom` is a basic MMA operation and provides three methods to adjust the shared memory layout so that it fits the MMA operation.
+```
+make_fragment_C(CTensor&& ctensor)
+
+make_fragment_A(CTensor&& ctensor)
+
+make_fragment_B(CTensor&& ctensor)
+```
+
+#### TiledMMA
+`TiledMMA` describes how to organize a tile of data within a CTA to fit the MMA operation. It can be created using the following function:
+```
+template <class MMA_Op,
+          class MMAThrLayout = Layout<Shape<_1,_1,_1>>,
+          class Permutations = Tile<Underscore,Underscore,Underscore>>
+CUTE_HOST_DEVICE constexpr
+auto
+make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom,
+               MMAThrLayout     const& thr_layout   = {},
+               Permutations     const& permutations = {})
+{
+  auto thr_layout_mnk  = append<3>(thr_layout, Layout<_1,_0>{});
+  auto permutation_mnk = append<3>(permutations, _);
+
+  return TiledMMA<MMA_Atom<MMA_Op>,
+                  decltype(thr_layout_mnk),
+                  decltype(permutation_mnk)>{mma_atom, thr_layout_mnk};
+}
+```
+Except for `MMA_Atom`, we will next discuss `MMAThrLayout` and `Permutations`. `MMAThrLayout` specifies the thread layout along the M, N, and K dimensions for a single `MMA_Atom`. `Permutations` defines the arrangement of each dimension, ensuring that the output matrix can be accessed continuously by every thread. The following two comparative diagrams from the [official CUTE discussion](https://github.com/NVIDIA/cutlass/discussions/1345) help illustrate these concepts.
+
+***Before permutation***
+![TiledMMA_permutation_before](./src_pictures/TiledMMA_permutation_before.png)
+
+***After permutation***
+![TiledMMA_permutation_after](./src_pictures/TiledMMA_permutation_after.png)
+
+#### ThrMMA
+`ThrMMA` indicates that each thread is responsible for a tile of MMA operation within a CTA. It also provides function interfaces for partitioning a memory tile to fit the MMA operation for each thread.
+```
+ template <class CTensor>
+  CUTE_HOST_DEVICE constexpr
+  auto
+  partition_fragment_C(CTensor&& ctensor) const
+  {
+    return TiledMMA::make_fragment_C(partition_C(ctensor));
+  }
+
+  template <class ATensor>
+  CUTE_HOST_DEVICE constexpr
+  auto
+  partition_fragment_A(ATensor&& atensor) const
+  {
+    return TiledMMA::make_fragment_A(partition_A(atensor));
+  }
+
+  template <class BTensor>
+  CUTE_HOST_DEVICE constexpr
+  auto
+  partition_fragment_B(BTensor&& btensor) const
+  {
+    return TiledMMA::make_fragment_B(partition_B(btensor));
+  }
+```
+
+### Swizzle
+In the final section, we will talk about a necessary operation: `swizzle`. Throughout CUTE, there are two types of `swizzle` operations: one for SMEM and another for thread blocks. We focus on the former. The latter is briefly introduced due to the limited documentation, which prevents a detailed explanation.
+
+#### SMEM Swizzle
+It is acknowledged that SMEM has 32 banks, each storing 32-bit units. This design allows all 32 banks to be accessed by 32 threads (a warp) simultaneously. However, if multiple threads access different addresses within the same bank, this leads to poor performance known as bank conflict. To address this, CUTE introduces the `swizzle` operation, which can be described by the following formula.   
+
+$$
+offest_{bank_conflict_free}=Swizzle(Layout(Corrd))
+$$
+
+Two documents are recommended for further reading: [Swizzle Models](https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-swizzling-modes) and [Shared Memory Layout and Swizzling](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-shared-memory-layout-swizzling).
+
+For instance, consider the following code snippet:
+```
+swizzle<B, M, S>(offset)
+```
+
+A brief note on the parameters of the above code snippet:
+
+`B`: specifies the number of rows, which is $2^B$.  
+`M`: specifies the number of basic elements, which is $2^M$.  
+`S`: specifies the number of columns, which is $2^S$.    
+
+This can be explained by the example `swizzle(1,1,2)`, as shown in the graph below.
+
+![swizzle](./src_pictures/swizzle.png)
+
+The above figure shows that `Swizzle` rearranges the data based on $2^M$ elements. This can be explained by the following formula:
+
+$$
+Swizzle(Coord(irow,icol))=(irow,irow \oplus icol)
+$$
+
+Notice that the `XOR` operation is bijective, meaning each input produces a unique output and can be reversed.
+
+However, how do we select appropriate `Swizzle` parameters? Actually, the recommended documents explain this. For example, the following picture from the NVIDIA documentation illustrates the selection:
+
+![swizzle_layout](./src_pictures/swizzle_layout.png)
+
+The above shapes are for elements of size 128 bits. For smaller element sizes, the same shapes would get multiplied along the leading dimension by a factor of `128 / sizeof_bits(Element)`. For example, 128B MN major with 16B atomicity swizzle atom would have a shape of `(8*(128/32))x8 = 32x8` for tf32 tensor core inputs.
+
+Finally, let's look at an example to thoroughly understand how `Swizzle` addresses bank conflicts. There is a composed layout of SMEM.
+```
+cute::ComposedLayout<
+      cute::Swizzle<3, 4, 3>, 
+      cute::smem_ptr_flag_bits<16>, 
+      cute::Layout<cute::tuple<cute::tuple<cute::C<128>, cute::C<16>>, cute::_1, cute::tuple<cute::_4, cute::_2>, cute::_2>, cute::tuple<cute::tuple<cute::_64, cute::_1>, cute::_0, cute::tuple<cute::C<16>, cute::C<8192>>, cute::_16384>>
+      >
+```
+
+Next, we consider an atom with `shape(128,16)` and keep the K-major leading dimension.
+```
+cute::ComposedLayout<
+      cute::Swizzle<3, 4, 3>, 
+      cute::smem_ptr_flag_bits<16>, 
+      cute::Layout<cute::tuple<cute::C<128>, cute::C<16>>, cute::tuple<cute::_64, cute::_1>>
+      >
+```
+
+Obviously, after the `Swizzle` operation, the shape of SMEM is `(8,8)` with base units of 16 elements, each 16 bits. This means that 8 elements will be addressed by a thread, corresponding to 32 bytes. For a warp, the total addressed size is 1024 bytes, which is the maximum size a warp can address.
+
+Next, we will explain this in detail using the graph below. To aid understanding, we adjust the original layout shape `(128, 16)` so that the number of columns matches the number of banks. Meanwhile, the smallest unit size is 32 bits instead of 16 bits, as shown below.
+
+![swizzle_example_figure_1](./src_pictures/swizzle_example_figure_1.png)
+
+The region surrounded by the red dashed line is addressed by 32 threads (a warp), with each thread handling 8 elements. This results in serious bank conflicts, specifically a 24-way conflict. To resolve this, we use `Swizzle<3, 4, 3>` to adjust the SMEM layout to a shape of `(8,8)`, where each unit is 128 bits (16 bytes), as shown below.
+
+![swizzle_example_figure_1](./src_pictures/swizzle_example_figure_2.png)
+
+The above figure provides a detailed depiction of the `Swizzle` process, so no further details are provided here. For further information, refer to [Swizzle Models](https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-swizzling-modes) and [Shared Memory Layout and Swizzling](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-shared-memory-layout-swizzling).
+
+#### Thread Block Swizzle
+`Thread Block Swizzle` is used by CTAs to improve L2 cache efficiency when accessing global memory. More details will be added in the future.
+
+## Pipeline
 Updating ... ... ...
