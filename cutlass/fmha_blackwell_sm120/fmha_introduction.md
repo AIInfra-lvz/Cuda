@@ -818,8 +818,9 @@ unstageSmemLayout(Layout const& layout, Stages stages = {})
 ```
 Note that the use of `composition` has certain requirements, which are explained in detail in the official documentation.   
 
-Next, let's look at the operations: product and divide. These are also `Layout` operations, just like those discussed above. We will briefly discuss them here, as the [official documentation](https://docs.nvidia.com/cutlass/media/docs/cpp/cute/02_layout_algebra.html) provides detailed examples.    
-**Product**
+Next, let's look at the operations: product and divide. These are also `Layout` operations, just like those discussed above. We will briefly discuss them here, as the [official documentation](https://docs.nvidia.com/cutlass/media/docs/cpp/cute/02_layout_algebra.html) provides detailed examples.
+    
+**Product**   
 The product of a `Layout` is conceptually similar to ordinary multiplication of real numbers, representing repeated instances of a variable. Informally, there are two types of product operations: 1-D and 2-D. The 1-D operations include `logical_product`, `zipped_product`, `tiled_product`, and `flat_product`. The 2-D operations involve `blocked_product` and `raked_product`. If you are familiar with the official CUTE documentation, you may notice that this classification is not strictly accurate, but it is practical and useful for understanding. The official documentation explains `blocked_product` and `raked_product` in detail, but the author is currently not familiar with them, so they will not be discussed further here. Next, we will demonstrate the essence of the 1-D operations using `logical_product` as an example. The definition of `logical_product` is shown below.
 ```
 template <class LShape, class LStride,
@@ -846,7 +847,7 @@ tiled_product   : ((M,N), TileM, TileN, L, ...)
 flat_product    : (M, N, TileM, TileN, L, ...)
 ```
 
-**Division**
+**Division**    
 The operation division is different with division of real numbers. the division of `Loyout` indicates a hierarchical division, such as `6 / 2 = (2, 3)`. Similar to product, division can also be classified strictly into two categories of 1-D and 2-D. We will also just talk about `layout_divide ` operation. The definition is shown below.   
 ```
 template <class LShape, class LStride,
@@ -1214,7 +1215,7 @@ In the final section, we will talk about a necessary operation: `swizzle`. Throu
 It is acknowledged that SMEM has 32 banks, each storing 32-bit units. This design allows all 32 banks to be accessed by 32 threads (a warp) simultaneously. However, if multiple threads access different addresses within the same bank, this leads to poor performance known as bank conflict. To address this, CUTE introduces the `swizzle` operation, which can be described by the following formula.   
 
 $$
-offest_{bank_conflict_free}=Swizzle(Layout(Corrd))
+offest_{bank\_conflict\_free}=Swizzle(Layout(Corrd))
 $$
 
 Two documents are recommended for further reading: [Swizzle Models](https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-swizzling-modes) and [Shared Memory Layout and Swizzling](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-shared-memory-layout-swizzling).
@@ -1281,5 +1282,12 @@ The above figure provides a detailed depiction of the `Swizzle` process, so no f
 #### Thread Block Swizzle
 `Thread Block Swizzle` is used by CTAs to improve L2 cache efficiency when accessing global memory. More details will be added in the future.
 
-## Pipeline
+## Overview
+Actually, a kernel can be simply divided into three sections: memory access, computation, and pipeline. The first two are basically provided by CUTE, while the latter needs to be implemented by users. The so-called pipeline refers to how we organize the order of memory access and computation to maximize their overlap. However, since memory is limited, there is always a tradeoff between memory access and computation.    
+
+Next, we will introduce the Collective Layer in detail. It mainly consists of two sections: the mainloop and the epilogue. The mainloop generally handles GEMM operations, while the epilogue quantizes the results. However, FMHA is different in that all its operations are placed in the mainloop section. Its epilogue simply stores the results from SMEM to global memory using TMA. Therefore, we will focus on the mainloop section and briefly mention the epilogue section. Before that, an overview diagram of the mainloop pipeline is provided below.
+
+![pipeline_overview](./src_pictures/pipeline_overview.png)
+
+## Mainloop
 Updating ... ... ...
