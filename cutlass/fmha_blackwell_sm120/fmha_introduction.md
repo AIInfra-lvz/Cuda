@@ -44,7 +44,7 @@ As shown in the picture below, the basic computing steps of FMHA are illustrated
 The flow chart illustrates the flow of each fragmented computation within a block of the CUDA kernel. Each node consists of two parts: stage and detail. The stages include Load, MMA, Softmax, Correction, and Epilogue. These stages represent the organizational structure in the post-kernel layer. The details show the specific events that are carried out in the collective layer. In addition, the side-by-side nodes can be seen as being executed in parallel, and the overlap of multi-stage memory access and computation is not shown.
 
 # Device Layer
-Firstly, we will discuss the top layer of CUTLASS: device. The device layer describes the host code responsible for two main tasks: the conversion of outer arguments to inner parameters and the launch methods of CUDA kernels. It serves as the entry point for running the kernel. We will not explain every sentence or line of code, so you may need to read some coding details on your own in fmha_blackwell_sm120/device/fmha.hpp.
+Firstly, we will discuss the top layer of CUTLASS: device. The device layer describes the host code responsible for two main tasks: the conversion of outer arguments to inner parameters and the launch methods of CUDA kernels. It serves as the entry point for running the kernel. We will not explain every sentence or line of code, so you may need to read some coding details on your own in *fmha_blackwell_sm120/device/fmha.hpp*.
 
 The template parameter of device layer class is the kernel layer template class, which provides the methods for the argument conversion, shared memory size, grid shape and other global memory size if needed.
 
@@ -119,7 +119,7 @@ TMA is a new feature introduced in the NVIDIA Hopper™ architecture for doing a
 We divide the TMA section into three main parts: the first covers TMA load, the second covers TMA store, and the third discusses more advanced operations such as TMA store reduce and TMA load multicast. In essence, TMA load copies data from the GPU’s GMEM into a CTA’s SMEM, while TMA store copies data from a CTA’s SMEM to the GPU’s GMEM. We will introduce most of the necessary concepts about TMA. 
 
 #### TMA Load/Store
-TMA load copies data from GMEM into SMEM, while TMA store does the opposite. This copy operation is limited in that only one thread is responsible for issuing the operation, as shown in the code snippet below from the file fmha_blackwell_sm120/collective/sm120_fmha_load_tma_warpspecialized.hpp.
+TMA load copies data from GMEM into SMEM, while TMA store does the opposite. This copy operation is limited in that only one thread is responsible for issuing the operation, as shown in the code snippet below from the file *fmha_blackwell_sm120/collective/sm120_fmha_load_tma_warpspecialized.hpp*.
 ```
 uint32_t lane_predicate = cute::elect_one_sync();       // select only one thread, usually the 0th thread.
 if (lane_predicate)
@@ -128,7 +128,7 @@ if (lane_predicate)
     copy(params.tma_load_q.with(*tma_barrier, 0), tQgQ(_, q0_index), tQsQ(_, pipeline_q_producer_state.index()));
 }
 ```
-As shown in the corresponding PTX code snippet below from the file cute/arch/copy_sm90_tma.hpp.
+As shown in the corresponding PTX code snippet below from the file *cute/arch/copy_sm90_tma.hpp*.
 ```
 #if defined(CUTE_ARCH_TMA_SM120_ENABLED)
     asm volatile (
@@ -148,7 +148,7 @@ As shown in the corresponding PTX code snippet below from the file cute/arch/cop
       : "memory");
 #endif
 ```
-However, all the threads within the CTA should wait for the copy operation to complete, as implemented in the PTX code snippet below from the file cutlass/arch/barrier.h.
+However, all the threads within the CTA should wait for the copy operation to complete, as implemented in the PTX code snippet below from the file *cutlass/arch/barrier.h*.
 ```
   CUTLASS_HOST_DEVICE
   static void wait(ValueType const* smem_ptr, uint32_t phase) {
@@ -174,7 +174,7 @@ However, all the threads within the CTA should wait for the copy operation to co
 #endif
   }
 ```
-Actually, instead of using this API directly, we call higher-level instructions such as the `consumer_wait` API and similar functions provided by the pipeline object from the file cutlass/pipeline/sm_90_pipeline.hpp.      
+Actually, instead of using this API directly, we call higher-level instructions such as the `consumer_wait` API and similar functions provided by the pipeline object from the file *cutlass/pipeline/sm_90_pipeline.hpp*.      
 In addition, compared to TMA load, TMA store has some differences.
 ```
 if (lane_predicate)
@@ -204,7 +204,7 @@ More details about TMA multicast and TMA store reduce are not explained here. Th
 ### Tensor Memory (TMEM)
 A [blog](https://research.colfax-intl.com/cutlass-tutorial-writing-gemm-kernels-using-tensor-memory-for-nvidia-blackwell-gpus/) and [PTX documentation](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tensor-memory-addressing) are recommended for a detailed understanding of TMEM. This section refers to both of them.  
 
-TMEM is introduced by the NVIDIA Blackwell architecture (SM100) and is a dedicated on-chip memory for use by Tensor Cores. Its primary purpose is to replace registers for 5th generation Tensor Core operations by using TMEM instead. The MMA instruction for TMEM is UMMA, which differs from the WGMMA instruction in that it supports low-precision data types, including FP4 and FP6, provides increased throughput across all precisions, and can only be launched by one thread in a CTA. Two adjacent CTAs within an SM cluster, called a CTA pair, can work on UMMA together across two SMs. Even when using two CTAs, only one thread in one CTA launches UMMA.  Obviously, TMEM solves the problem of high register usage when implementing GEMM.  
+TMEM is introduced by the NVIDIA Blackwell architecture (SM100) and is a dedicated on-chip memory for use by Tensor Cores. Its primary purpose is to replace registers for 5th generation Tensor Core operations by using TMEM instead. The MMA instruction for TMEM is `UMMA`, which differs from the WGMMA instruction in that it supports low-precision data types, including FP4 and FP6, provides increased throughput across all precisions, and can only be launched by one thread in a CTA. Two adjacent CTAs within an SM cluster, called a CTA pair, can work on `UMMA` together across two SMs. Even when using two CTAs, only one thread in one CTA launches `UMMA`.  Obviously, TMEM solves the problem of high register usage when implementing GEMM.  
 
 TMEM is 256KB per SM in size, and is organized 2-dimensionally in 512 columns and 128 rows, or lanes, of 32-bit cells. This inherent 2-D structure is reflected in the 32-bit addresses as well, where bits 31-16 denote the lane ID while 15-0 denote the column. This image from the PTX documentation shows the layout:
 
@@ -254,8 +254,9 @@ Typically, data gets into TMEM via UMMA operations, and is explicitly moved out 
 Finally, besides UMMA operations and these data movement instructions, no other operations access data from TMEM. In other words, all pre-processing must happen before the data is loaded onto TMEM, and all post-processing must happen after the data is retrieved out of TMEM.
 
 #### UMMA
-UMMA only use TMEM and its low-level is `tcgen05.mma` operation. From the [table of supported matrix shapes](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-kind-shapes), we see that MMA instructions are available in shapes 64 x N x 16 with N a multiple of 8 and 128 x N x 16 with N a multiple of 16, where in both cases N is at most 256. (For all data types, K is expected to be 32 bytes wide for dense GEMM.) Note that the largest UMMA atom, 128 x 256 x 16, is twice as large as the largest WGMMA atom. Its accumulator takes up exactly half of TMEM, meaning that several UMMA atoms can be pipelined without sacrificing performance. 
-In addition, for executing D = A × B + D, UMMA supports limited matrix multiplication in two situations: (1) both matrices A and B use SMEM, and (2) matrix A uses TMEM while matrix B uses SMEM. In both cases, matrix D must use TMEM. These cases can be described by the instructions SM100_MMA_F16BF16_SS and SM100_MMA_F16BF16_TS, for example:
+UMMA only use TMEM and its low-level is `tcgen05.mma` operation. From the [table of supported matrix shapes](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-kind-shapes), we see that MMA instructions are available in shapes 64 x N x 16 with N a multiple of 8 and 128 x N x 16 with N a multiple of 16, where in both cases N is at most 256. (For all data types, K is expected to be 32 bytes wide for dense GEMM.) Note that the largest UMMA atom, 128 x 256 x 16, is twice as large as the largest WGMMA atom. Its accumulator takes up exactly half of TMEM, meaning that several UMMA atoms can be pipelined without sacrificing performance.     
+
+In addition, for executing D = A × B + D, UMMA supports limited matrix multiplication in two situations: (1) both matrices A and B use SMEM, and (2) matrix A uses TMEM while matrix B uses SMEM. In both cases, matrix D must use TMEM. These cases can be described by the instructions `SM100_MMA_F16BF16_SS` and `SM100_MMA_F16BF16_TS`, for example:
 ```
 // both of SMEM
 TiledMMA tiled_mma = make_tiled_mma(SM100_MMA_F16BF16_SS<TypeA, TypeB, TypeC,                 
@@ -272,7 +273,7 @@ TiledMMA tiled_mma = make_tiled_mma(SM100_MMA_F16BF16_TS<TypeA, TypeB, TypeC,
 Notice again that UMMA can be launched by only one thread in a CTA.
 
 #### Copy out of TMEM
-Once all the MMAs are done, we need to copy the accumulator results from TMEM to registers. This is done using the PTX tcgen05.ld instruction. CUTLASS abstracts tcgen05.ld as a copy atom, with different variants we saw earlier represented as different copy traits defined in copy atoms found in cute/atom/copy_traits_sm100.hpp. For example, the `SM100_TMEM_LOAD_32dp32b1x` atom describes these details: `32dp` indicates the fully active threads in a warp, `32b` denotes 32 bits for each element, and `1x` indicates the repetition count. More instruction types can be found in the file cute/arch/copy_sm100.hpp. The code snippet below shows the specific definition of the `SM100_TMEM_LOAD_32dp32b1x` atom as an example.
+Once all the MMAs are done, we need to copy the accumulator results from TMEM to registers. This is done using the PTX tcgen05.ld instruction. CUTLASS abstracts tcgen05.ld as a copy atom, with different variants we saw earlier represented as different copy traits defined in copy atoms found in *cute/atom/copy_traits_sm100.hpp*. For example, the `SM100_TMEM_LOAD_32dp32b1x` atom describes these details: `32dp` indicates the fully active threads in a warp, `32b` denotes 32 bits for each element, and `1x` indicates the repetition count. More instruction types can be found in the file *cute/arch/copy_sm100.hpp*. The code snippet below shows the specific definition of the `SM100_TMEM_LOAD_32dp32b1x` atom as an example.
 ```
 // 32 data path lanes, 32-bit pattern, repeated 1 times
 struct SM100_TMEM_LOAD_32dp32b1x
@@ -303,7 +304,7 @@ TiledCopy tiled_t2r_copy = make_tmem_copy(SM100_TMEM_LOAD_32dp32b1x{}, tCtAcc);
 // Get the copy operation for the accumulator assigned to the current thread
 ThrCopy   thr_t2r_copy   = tiled_t2r_copy.get_slice(threadIdx.x);
 ```
-One important thing to know about `make_tmem_copy` function is that it is hardcoded to use 4 warps, or 1 warpgroup. As shown in PTX code snippet from the file cute/atom/copy_traits_sm100.hpp.
+One important thing to know about `make_tmem_copy` function is that it is hardcoded to use 4 warps, or 1 warpgroup. As shown in PTX code snippet from the *file cute/atom/copy_traits_sm100.hpp*.
 ```
 template <class CopyOp, class CopyT,
           class TEngine, class TLayout>
@@ -420,6 +421,7 @@ The following requirements are from the [Miscellaneous Instructions: setmaxnreg]
 (7) The mandatory `.aligned` qualifier indicates that all threads in the warpgroup must execute the same `setmaxnreg` instruction. In conditionally executed code, the `setmaxnreg` instruction should only be used if it is known that all threads in the warpgroup evaluate the condition identically; otherwise, the behavior is undefined.    
 
 Except for additional debug printf registers, `NumRegsOther` refers to the MMA, Load, and Epilogue operations. These operations mainly use SMEM and TMEM, so they require only a few registers to store several variables, rather than large tile tensor data. Requirements (4), (6), and (7) above explain why `NumRegsEmpty` is set to 24, and why MMA, Load, Epilogue, and Empty all belong to the same warpgroup and maintain a maximum value less than 255 per thread in the CTA.    
+
 Softmax and Correction require more registers because both are post-processing steps for TMEM. They need to copy data from TMEM to registers for additional computation. The specific register values will be demonstrated in the Collective Layer Softmax and Correction section.  
 
 Additionally, as an additional point, we use the high-level API `warpgroup_reg_set` to set the number of registers per thread. The API details are as follows:
@@ -441,7 +443,7 @@ warpgroup_reg_set()
 As the code snippet above shows, the constant value 128 is used to determine whether to allocate or deallocate registers. Why 128? Consider that the maximum number of registers per-CTA is 65536, and there are 16 warps in a CTA. Therefore, the average number of registers per thread is 128.  
 
 ### Pipeline Creation
-From the above specifications, it is easy to understand why different warp roles are defined and how to set the corresponding parameters. Now, let's return to the Kernel Layer to see what needs to be done. In fact, the file fmha_blackwell_sm120/kernel/sm120_fmha_fwd_kernel_tma_warpsspecialized.hpp clearly shows that the main task of the kernel layer within FMHA is to create a pipeline variable and establish a producer-consumer mechanism between different warp roles. For example:
+From the above specifications, it is easy to understand why different warp roles are defined and how to set the corresponding parameters. Now, let's return to the Kernel Layer to see what needs to be done. In fact, the file *fmha_blackwell_sm120/kernel/sm120_fmha_fwd_kernel_tma_warpsspecialized.hpp* clearly shows that the main task of the kernel layer within FMHA is to create a pipeline variable and establish a producer-consumer mechanism between different warp roles. For example:
 ```
 // between LoadQ and UMMA
 typename CollectiveMainloop::PipelineQ::Params pipeline_load_q_params;
@@ -487,7 +489,7 @@ Another interesting aspect is how synchronization between the producer and consu
 typename CollectiveMainloop::PipelineQ::PipelineState pipeline_load_q_consumer_state;
 typename CollectiveMainloop::PipelineQ::PipelineState pipeline_load_q_producer_state = cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineQ>();
 ```
-The deatil code snippet of `PipelineState` in file cutlass/pipeline/sm90_pipeline.hpp:
+The deatil code snippet of `PipelineState` in file *cutlass/pipeline/sm90_pipeline.hpp*:
 ```
 template<uint32_t Stages_>
 struct PipelineState {
@@ -520,7 +522,7 @@ struct PipelineState {
   }
 }
 ```
-`Stages` represents the number of memory buffers used for pipelining, determining the degree of overlap between memory access and computation. This is analogous to double buffering or ping-pong methods commonly used in single-precision matrix multiplication with CUDA cores. `index_` is the array subscript indicating the current buffer, and `phase_` indicates whether the buffer is available for use. To better illustrate the roles of `index_` and `phase_`, consider the following code snippet from cutlass/pipeline/sm100_pipeline.hpp and cutlass/pipeline/sm90_pipeline.hpp:
+`Stages` represents the number of memory buffers used for pipelining, determining the degree of overlap between memory access and computation. This is analogous to double buffering or ping-pong methods commonly used in single-precision matrix multiplication with CUDA cores. `index_` is the array subscript indicating the current buffer, and `phase_` indicates whether the buffer is available for use. To better illustrate the roles of `index_` and `phase_`, consider the following code snippet from *cutlass/pipeline/sm100_pipeline.hpp* and *cutlass/pipeline/sm90_pipeline.hpp*:
 ```
 // cutlass/pipeline/sm90_pipeline.hpp
 template <int Stages_>
@@ -559,7 +561,7 @@ public:
   ...
 }
 ```
-Obviously, both `full_barrier_ptr_` and `empty_barrier_ptr_` are arrays in shared memory (SMEM) and work together to maintain synchronization. `empty_barrier_ptr_` records the status of the producer buffer, while `full_barrier_ptr_` records the status of the consumer buffer. When `producer_acquire` is called, it updates the buffer status in the `empty_barrier_ptr_` array at the position specified by the `index_` and `phase_` fields of `PipelineState`. Similarly, the `full_barrier_ptr_` array is updated for the consumer side. For more details, refer to cutlass/pipeline/sm90_pipeline.hpp.
+Obviously, both `full_barrier_ptr_` and `empty_barrier_ptr_` are arrays in shared memory (SMEM) and work together to maintain synchronization. `empty_barrier_ptr_` records the status of the producer buffer, while `full_barrier_ptr_` records the status of the consumer buffer. When `producer_acquire` is called, it updates the buffer status in the `empty_barrier_ptr_` array at the position specified by the `index_` and `phase_` fields of `PipelineState`. Similarly, the `full_barrier_ptr_` array is updated for the consumer side. For more details, refer to *cutlass/pipeline/sm90_pipeline.hpp*.
 
 ## Tile Scheduler
 This section will illustrate two tile scheduling strategies: persistent and non-persistent tile schedulers.
@@ -886,7 +888,7 @@ In addition, for more information about tensor algorithms, refer to the [CuTe Te
 The copy abstraction is a core component, including `cute::copy()`, `CopyOperation`, `Copy_Traits`, `Copy_Atom`, `TiledCopy`, and `ThrCopy`. We will introduce each of these constructs in detail.    
 
 #### cute::copy()
-`cute::copy()` is the top-level universal interface for performing data load and store operations. It is worth noting that moving a tile of data from the source address to the destination address typically requires repeated execution of the `Copy_Atom` operation. The following code snippet from cute/algorithm/copy.hpp demonstrates this:  
+`cute::copy()` is the top-level universal interface for performing data load and store operations. It is worth noting that moving a tile of data from the source address to the destination address typically requires repeated execution of the `Copy_Atom` operation. The following code snippet from *cute/algorithm/copy.hpp* demonstrates this:  
 ```
 template <class... CopyArgs,
           class SrcEngine, class SrcLayout,
@@ -942,7 +944,7 @@ copy(Copy_Atom<CopyArgs...>       const& copy_atom,
 The for loop indicates that the data of a tile in a CTA generally needs to be copied repeatedly, even though we only call `cute::copy()` once within the kernel.
 
 #### CopyOperation
-After introducing `cute::copy`, we should discuss `Copy_Atom`. However, we will first explain `CopyOperation`, since it is the core component of `Copy_Atom` and should be introduced before. `CopyOperation` is essentially the execution instruction for `Copy_Atom`, encapsulating the relevant PTX instructions. For example, as shown in the following example from cute/arch/copy_sm100_tma.hpp:
+After introducing `cute::copy`, we should discuss `Copy_Atom`. However, we will first explain `CopyOperation`, since it is the core component of `Copy_Atom` and should be introduced before. `CopyOperation` is essentially the execution instruction for `Copy_Atom`, encapsulating the relevant PTX instructions. For example, as shown in the following example from *cute/arch/copy_sm100_tma.hpp*:
 ```
 struct SM100_TMA_2SM_LOAD_MULTICAST_2D
 {
@@ -972,13 +974,13 @@ struct SM100_TMA_2SM_LOAD_MULTICAST_2D
 ```
 
 #### Copy_Traits
-Next, we also see another core component of `Copy_Atom`, which is `Copy_Traits`. `Copy_Traits` can be seen as providing more detailed and essential information to `Copy_Atom`, but this information does not need to be managed by users. It includes the TMA descriptor `TmaDescriptor`, other auxiliary parameters, and necessary method functions. The details are omitted here for brevity. It is recommended to read various files related to `Copy_Traits`, such as cute/atom/copy_traits_sm100_tma.hpp and others.    
+Next, we also see another core component of `Copy_Atom`, which is `Copy_Traits`. `Copy_Traits` can be seen as providing more detailed and essential information to `Copy_Atom`, but this information does not need to be managed by users. It includes the TMA descriptor `TmaDescriptor`, other auxiliary parameters, and necessary method functions. The details are omitted here for brevity. It is recommended to read various files related to `Copy_Traits`, such as *cute/atom/copy_traits_sm100_tma.hpp* and others.    
 
 #### Copy_Atom
-`Copy_Atom` is a basic atomic operation that can be executed by one or multiple threads within a warp. Typically, only one thread is responsible for the `TMA` operation. It serves as the implementation entry point for the copy operation. The relevant code can be found in cute/atom/copy_atom.hpp.
+`Copy_Atom` is a basic atomic operation that can be executed by one or multiple threads within a warp. Typically, only one thread is responsible for the `TMA` operation. It serves as the implementation entry point for the copy operation. The relevant code can be found in *cute/atom/copy_atom.hpp*.
 
 #### TiledCopy
-`TiledCopy` encapsulates one or multiple `Copy_Atom` operations, describing how a tile of data in a CTA is organized by `Copy_Atom` operations. Its shape can be simply understood as having two modes: one represents the data layout for a single `Copy_Atom`, and the other indicates the number of repetitions. It provides methods to allocate a tile of data in a CTA to each thread shape, but these methods are not exposed to users here. The relevant code can be found in cute/atom/copy_atom.hpp. 
+`TiledCopy` encapsulates one or multiple `Copy_Atom` operations, describing how a tile of data in a CTA is organized by `Copy_Atom` operations. Its shape can be simply understood as having two modes: one represents the data layout for a single `Copy_Atom`, and the other indicates the number of repetitions. It provides methods to allocate a tile of data in a CTA to each thread shape, but these methods are not exposed to users here. The relevant code can be found in *cute/atom/copy_atom.hpp*. 
 
 #### ThrCopy
 `ThrCopy` is the thread-level operation, indicating how to map each thread's register fragment data to the tiled data of a CTA. It provides the user interface to partition a tile of data to a single thread. For example:
@@ -1140,7 +1142,7 @@ using Layout_K_SW64_Atom  = decltype(upcast<sizeof_bits<Type>::value>(Layout_K_S
 template <class Type>
 using Layout_K_SW128_Atom = decltype(upcast<sizeof_bits<Type>::value>(Layout_K_SW128_Atom_Bits{}));
 ```
-The above code snippet shows that an atomic MMA operation must specify the data size. It also explains how the shared memory layout is organized for a single MMA_Atom operation. For further details, see cute/atom/mma_traits_sm100.hpp and cute/atom/mma_traits_sm90_gmma.hpp.
+The above code snippet shows that an atomic MMA operation must specify the data size. It also explains how the shared memory layout is organized for a single MMA_Atom operation. For further details, see *cute/atom/mma_traits_sm100.hpp* and *cute/atom/mma_traits_sm90_gmma.hpp*.
 
 #### MMA_Atom
 `MMA_Atom` is a basic MMA operation and provides three methods to adjust the shared memory layout so that it fits the MMA operation.
@@ -1290,4 +1292,235 @@ Next, we will introduce the Collective Layer in detail. It mainly consists of tw
 ![pipeline_overview](./src_pictures/pipeline_overview.png)
 
 ## Mainloop
+This section provides a concrete implementation of each conditional branch within the Kernel Layer. Accordingly, the Mainloop is divided into four parts: Load, MMA, Softmax, and Correction. Next, we will explain each part in detail, including code implementation. However, before introducing these components, we need to review a prologue that includes some essential variable type declarations.
+
+### Prologue
+This section introduces the main variable types used in the mainloop—MMA, SMEM, TMEM, and pipeline—and explains the rationale behind their specific parameter settings and configurations in the FMHA kernel.    
+
+**MMA**   
+We need two MMA class types within the Collective Layer provided by Cutlass because we need to execute two GEMM operations: $Q * K^{T}$ and $P * V$. The code snippets are as follows:
+```
+using CollectiveMmaQK = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    Element, StrideQ, Alignment,
+    Element, StrideK, Alignment,
+    ElementQK,
+    TileShapeQK, ClusterShape, cutlass::gemm::collective::StageCount<3> /* we change it later anyways*/,
+    cutlass::gemm::KernelTmaWarpSpecialized1SmSm100>::CollectiveOp;
+```
+```
+using CollectiveMmaPV = typename cutlass::gemm::collective::CollectiveBuilder<
+  cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+  // the stride for A does not matter since we do not load from smem at all
+  Element, StrideK, Alignment,
+  Element, decltype(select<1,0,2>(StrideV{})), Alignment,
+  ElementPV,
+  TileShapePV, ClusterShape, cutlass::gemm::collective::StageCount<3> /* we change it later anyways*/,
+  cutlass::gemm::KernelTmaWarpSpecialized1SmSm100>::CollectiveOp;
+```
+Note that `CollectiveMmaPV` does not require the A matrix and needs the B matrix to be in MN-major format. This is because the result of `CollectiveMmaQK` is MN-major and will be stored in TMEM instead of SMEM. Therefore, the stride of the B matrix in `CollectiveMmaPV` needs to be reordered accordingly.    
+
+**SMEM**    
+The main goal of this section is to introduce the layout of SMEM. In fact, the layout is already provided by `CollectiveMmaQK` and `CollectiveMmaPV`. However, we need to adjust the stage dimension so that it is a value instead of a tuple, as follows:
+```
+using SmemLayoutQ = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutA{}, Int<StageCountQ>{}));
+```
+```
+template<class Layout, class Stages = _1>
+CUTE_DEVICE 
+constexpr auto 
+unstageSmemLayout(Layout const& layout, Stages stages = {}) 
+{
+    return composition(layout, prepend<decltype(rank(layout))::value>(make_layout(stages), _));
+}
+```
+Note that `prepend<decltype(rank(layout))::value>(make_layout(stages), _)` allows `composition` to adjust only the stage dimension while keeping other dimensions unchanged. It is recommended to further explore the underlying code implementation for more details.
+
+Next, we also need to define the following variable types to enable the Device Layer to allocate the required SMEM size.
+```
+struct TensorStorage
+{
+  cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
+  union {
+    cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
+    cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
+  };
+};
+```
+
+**TMEM**    
+In the previous section, TMEM was introduced in detail. It is known that the initial address of TMEM is stored in SMEM. However, how to partition the internal regions of TMEM is not discussed. In practice, users need to manually divide TMEM and record the starting address of each region.
+```
+enum class TmemAllocation : uint32_t 
+{
+  kSizeS = 128,
+  kSizeO = 128,
+  kSizeP = 32,
+  S0 = 0,
+  S1 = S0 + kSizeS,
+  V0 = S0,  // stats storage from softmax to correction
+  V1 = S1,
+  P0 = S0 + kSizeP,
+  P1 = S1 + kSizeP,
+  O0 = S1 + kSizeS,
+  O1 = O0 + kSizeO,
+  kEnd = O1 + kSizeO
+};
+```
+
+**Pipeline**
+We introcude the initialization of pipeline in Kernel Layer instead  introduce its types of variables. Now, we will give the example as follows:
+```
+// from load to mma warp, protects q in smem
+using PipelineQ = cutlass::PipelineTmaUmmaAsync<
+  StageCountQ,
+  typename CollectiveMmaQK::AtomThrShapeMNK
+>;
+
+// from load to mma warp, protects k/v in smem
+using PipelineKV = cutlass::PipelineTmaUmmaAsync<
+  StageCountKV,
+  typename CollectiveMmaQK::AtomThrShapeMNK
+>;
+
+// from mma to softmax0/1 warp, protects S in tmem
+// (not sure yet about the reverse direction)
+// there is one pipe per softmax warp, and the mma warp alternates between them
+using PipelineS = cutlass::PipelineUmmaAsync<1>;
+
+// from softmax0/1/ to correction wg
+using PipelineC = cutlass::PipelineAsync<1>;
+
+// from mma to correction
+using PipelineO = cutlass::PipelineUmmaAsync<2>;
+
+// from corr to epilogue
+using PipelineE = cutlass::PipelineAsync<2>;
+
+using OrderBarrierSoftmax = cutlass::OrderedSequenceBarrier<
+  /*stages*/ 1, /*groups*/ 2>;
+```
+Note that different pipeline stages use different types: `PipelineTmaUmmaAsync`, `PipelineUmmaAsync`, and `PipelineAsync`.
+
+### Load
+There are three global memory tensors (Q, K, V) that need to be loaded from global memory into SMEM. Instead of reintroducing the pipeline—which is already explained in detail in the Overview diagram and in the file *fmha_blackwell_sm120/sm120_fmha_load_tma_warpspecialized.hpp*—we will focus on how to determine the tile of data assigned to the current CTA.    
+
+First, let's look at a code snippet that demonstrates how to determine the tile of data assigned to each CTA.
+```
+ThrMMA mma_qk = typename CollectiveMmaQK::TiledMma{}.get_slice(0);    // only one CTA in group if multicast is not used
+Tensor mQ_qdl_p = params.tma_load_q.get_tma_tensor(select<0,2,3>(problem_shape));
+
+// Offsets for variable length sequences are not handled yet, so they are temporarily ignored
+int q_offs_0   = 0;
+int q_offs_2_1 = 0;
+Tensor mQ_qdl = domain_offset(make_coord(q_offs_0, _0{}, make_coord(_0{}, q_offs_2_1)), mQ_qdl_p);
+
+Tensor gQ_qdl   = local_tile(mQ_qdl, TileShapeQK{}, make_coord(_, _, _), Step<_1, X, _1>{});
+Tensor tSgQ_qdl = mma_qk.partition_A(gQ_qdl);
+Tensor sQ       = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
+
+auto [tQgQ_qdl, tQsQ] = tma_partition(
+  params.tma_load_q, /*not use mulitcast*/ _0{}, /*not use mulitcast*/ make_layout(_1{}),
+  group_modes<0,3>(sQ), group_modes<0,3>(tSgQ_qdl)
+);
+
+Tensor tQgQ = tQgQ_qdl(_, _, _0{}, get<2>(blk_coord_q));
+```
+
+Next, we will explain each step in detail. According to the code above, we first need to create a `TiledMMA` object, and then obtain a `ThrMMA` instance from it. For example:
+```
+ThrMMA mma_qk = typename CollectiveMmaQK::TiledMma{}.get_slice(0);    // only one CTA in group if multicast is not used
+```
+
+Note that the parameter for `get_slice(0)` is 0, which represents the current block or CTA rank in the cluster, rather than the thread ID of the current thread in the block. This is because multicast mode is not used here. If you want to use multicast, refer to the code snippet below or read this [TMA blog](https://research.colfax-intl.com/tutorial-hopper-tma/).
+```
+int lane_predicate = cute::elect_one_sync();
+
+uint16_t mcast_mask_b = 0;
+
+if (lane_predicate == 1) {
+  if constexpr (cute::is_same_v<typename CollectiveMmaQK::GmemTiledCopyB, SM90_TMA_LOAD_MULTICAST>) {
+    auto block_layout = Layout<ClusterShape>{}; // (m,n) -> block_id
+    for (int m = 0; m < size<0>(block_layout); ++m) {
+      mcast_mask_b |= (uint16_t(1) << block_layout(m,_0{},Int<0>{}));
+    }
+  }
+}
+```
+
+Next, we obtain the complete matrix tensor layout by using the following code.
+```
+Tensor mQ_qdl_p = params.tma_load_q.get_tma_tensor(select<0,2,3>(problem_shape));
+```
+
+As shown in the code above, we only provide the tensor `Shape`. This is because when the `tma_load_q` template type is created, the `Stride` is already specified via template parameters. Note that `tma_load_q` is a `Copy Atom` introduced in the CUTE section. It is instantiated as shown in the code snippet below.
+```
+using TMA_A = decltype(make_tma_atom_A_sm100<TmaInternalElementA>(
+    GmemTiledCopyA{},
+    make_tensor(recast_ptr<TmaInternalElementA>(nullptr), repeat_like(StrideA{}, int32_t(0)), StrideA{}),
+    SmemLayoutA{}(_,_,_,cute::Int<0>{}),
+    TileShape{},
+    TiledMma{},
+    ClusterLayout_VMNK{})
+  );
+```
+
+The implementation of `make_tma_atom_A_sm100` can be found in *cute/atom/copy_traits_sm100_tma.hpp* and *cute/atom/copy_traits_sm90_tma.hpp*. The code is straightforward and self-explanatory, so we do not provide further explanation here.
+
+The code snippet below can be ignored because it is used for variable-length sequences, which are not considered in the current FMHA kernel. It is preserved for future expansion.
+```
+// Offsets for variable length sequences are not handled yet, so they are temporarily ignored
+int q_offs_0   = 0;
+int q_offs_2_1 = 0;
+Tensor mQ_qdl = domain_offset(make_coord(q_offs_0, _0{}, make_coord(_0{}, q_offs_2_1)), mQ_qdl_p);
+```
+
+The following code snippet demonstrates how to determine the tile of data assigned to the current block. First, `local_tile` is used to partition the entire tensor in global memory into tiles of shape `TileShapeQK` for each block or CTA. Then, `partition_A` further divides the tile assigned to each CTA into fragments suitable for each thread, according to the `ThrMMA` mode.
+```
+Tensor gQ_qdl   = local_tile(mQ_qdl, TileShapeQK{}, make_coord(_, _, _), Step<_1, X, _1>{});
+Tensor tSgQ_qdl = mma_qk.partition_A(gQ_qdl);
+```
+
+**result**
+```
+// gQ_qdl
+cute::Tensor<cute::ViewEngine<cute::ArithmeticTupleIterator<cute::ArithmeticTuple<cute::C<0>, int, cute::C<0>, cute::C<0>, int>>>, cute::Layout<cute::tuple<cute::_128, cute::_128, int, int, cute::tuple<cute::tuple<int32_t, int32_t>, int>>, cute::tuple<cute::ScaledBasis<cute::C<1>, 1>, cute::ScaledBasis<cute::C<1>, 0>, cute::ScaledBasis<cute::C<128>, 1>, cute::ScaledBasis<cute::C<128>, 0>, cute::tuple<cute::tuple<cute::ScaledBasis<cute::C<1>, 2>, cute::ScaledBasis<cute::C<1>, 3>>, cute::ScaledBasis<cute::C<1>, 4>>>>>
+
+// tSgQ_qdl
+cute::Tensor<cute::ViewEngine<cute::ArithmeticTupleIterator<cute::ArithmeticTuple<cute::C<0>, int, cute::C<0>, cute::C<0>, int>>>, cute::Layout<cute::tuple<cute::tuple<cute::C<128>, cute::C<16>>, cute::_1, cute::_8, int, int, cute::tuple<cute::tuple<int32_t, int32_t>, int>>, cute::tuple<cute::tuple<cute::ScaledBasis<cute::C<1>, 1>, cute::ScaledBasis<cute::C<1>, 0>>, cute::C<0>, cute::ScaledBasis<cute::C<16>, 0>, cute::ScaledBasis<cute::C<128>, 1>, cute::ScaledBasis<cute::C<128>, 0>, cute::tuple<cute::tuple<cute::ScaledBasis<cute::C<1>, 2>, cute::ScaledBasis<cute::C<1>, 3>>, cute::ScaledBasis<cute::C<1>, 4>>>>>
+```
+
+Note that the usage of `local_tile` is explained in the CUTE section and will be omitted here. However, the parameter `Step<_1, X, _1>{}` deserves further discussion. It is used to project the K dimension, preventing `local_tile` from partitioning this dimension within the tile assigned to each CTA.
+
+Additionally, some readers may be confused about why `local_tile` does not specifically handle **GQA**. How should **GQA** be managed in this case? In fact, no special handling is required, as the grouping is automatically managed due to the carefully designed `Stride` of the K/V tensors, as shown below:
+```
+stride_K = make_stride(H_K*D, _1{}, make_stride(make_stride(_0{}, D), H_K*D*SK));
+stride_V = stride_K;
+```
+
+This indicates that the grouping dimension is 0, which is used by the `Layout` operation to determine the location.
+
+After processing the data source, the data destination—shared memory (SMEM)—also needs to be handled. This can be achieved by simply creating a tensor with `SmemLayoutQ{}` and the SMEM address. Bank conflicts can be ignored, as `make_tensor` automatically resolves them through the `Swizzle` operation.
+```
+Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
+```
+
+Using the methods described above, we can call `cute::copy()` to transfer data from global memory to shared memory (SMEM). However, further processing is required, as the data layout does not directly match the `MMA Atom`. Therefore, a corresponding `Copy Atom` must be created to align with the `MMA Atom`, as shown below:
+```
+auto [tQgQ_qdl, tQsQ] = tma_partition(
+  params.tma_load_q, /*not use mulitcast*/ _0{}, /*not use mulitcast*/ make_layout(_1{}),
+  group_modes<0,3>(sQ), group_modes<0,3>(tSgQ_qdl)
+);
+```
+
+Note that the parameter `_0{}` represents the coordinates of the current CTA within the cluster, and `make_layout(_1{})` specifies the cluster `Layout`. Both are used for multicast operations.
+
+Finally, we can locate the current CTA position in global memory, eg:
+```
+Tensor tQgQ = tQgQ_qdl(_, _, _0{}, get<2>(blk_coord_q));
+```
+
+Additionally, it is worth mentioning that the `Load` stage does not use registers, allowing the number of registers to be kept at the minimum value of 24. This returns surplus registers to the CTA's register pool, enabling other threads to utilize them.
+
+## MMA
 Updating ... ... ...
