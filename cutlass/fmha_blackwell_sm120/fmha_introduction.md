@@ -1505,7 +1505,7 @@ After processing the data source, the data destination—shared memory (SMEM)—
 Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
 ```
 
-Using the methods described above, we can call `cute::copy()` to transfer data from global memory to shared memory (SMEM). However, further processing is required, as the data layout does not directly match the `MMA Atom`. Therefore, a corresponding `Copy Atom` must be created to align with the `MMA Atom`, as shown below:
+Using the methods described above, we obtain data that conforms to the `MMA Atom` layout in both global memory and shared memory (SMEM). However, further processing is required, as the data layout does not directly match the `Copy Atom`. Therefore, a corresponding `Copy Atom` must be created to align with the `MMA Atom`, as shown below:
 ```
 auto [tQgQ_qdl, tQsQ] = tma_partition(
   params.tma_load_q, /*not use mulitcast*/ _0{}, /*not use mulitcast*/ make_layout(_1{}),
@@ -1520,7 +1520,223 @@ Finally, we can locate the current CTA position in global memory, eg:
 Tensor tQgQ = tQgQ_qdl(_, _, _0{}, get<2>(blk_coord_q));
 ```
 
-Additionally, it is worth mentioning that the `Load` stage does not use registers, allowing the number of registers to be kept at the minimum value of 24. This returns surplus registers to the CTA's register pool, enabling other threads to utilize them.
+Additionally, it is worth mentioning that the Load stage uses only a small number of registers, so that the number of registers used is kept at 48. This releases surplus registers back to the CTA's register pool, enabling other threads to utilize them.
 
 ## MMA
+The MMA section is responsible for the GEMM computations in the FMHA kernel, specifically $Q ∗ K^{T}$ and $P ∗ V$. It can be divided into two parts: data preparation and the computation pipeline. Data preparation describes how to adjust the input or output to fit the GEMM operation, while the computation pipeline explains how to achieve overlap between computation and memory access.
+
+### Data Preparation
+Instead of explaining each line of code, we will focus on some notable code snippets. First, we need to determine the number of iterations along the K-dimension due to the split-K trick.
+```
+int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
+```
+```
+template <class BlkCoord, class TileShape, class ProblemSize>
+CUTLASS_DEVICE int 
+get_masked_trip_count(
+    const BlkCoord& blk_coord,
+    const TileShape& tile_shape,
+    const ProblemSize& problem_size)
+{
+  if (get<1>(problem_size) % get<1>(tile_shape) != 0)
+  {
+    return 1;
+  }
+
+  return 0;
+}
+```
+
+Secondly, `TiledMMA` and `ThrMMA` need to be instantiated for GEMM QK and PV, respectively. However, they are different. Since GEMM PV uses the result of GEMM QK, which is stored in TMEM, the CollectiveMma layer of CUTLASS generally provides a `TiledMMA` in `SM100_MMA_F16BF16_SS` mode. For GEMM PV, the TiledMMA must be switched to `SM100_MMA_F16BF16_TS` mode, as shown below:
+```
+// gemm QK
+typename CollectiveMmaQK::TiledMma mma_qk;
+ThrMMA thr_mma_qk = mma_qk.get_slice(0);      // only one CTA in group because no multicast
+```
+```
+// gemm PV
+typename CollectiveMmaPV::TiledMma mma_pv;
+TiledMMA mma_pv_ts = to_tiled_mma_sm100_ts(mma_pv);   // p x v : tmem x smem
+ThrMMA thr_mma_pv  = mma_pv_ts.get_slice(0);          // only one CTA in group because no multicast
+```
+```
+template <class a_type, class b_type, class c_type,
+          int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg, class... TAs, class... TMs>
+CUTE_HOST_DEVICE constexpr
+auto
+to_tiled_mma_sm100_ts(
+    TiledMMA<MMA_Atom<
+      SM100_MMA_F16BF16_SS<a_type, b_type, c_type,
+                    M, N,
+                    a_major,
+                    b_major,
+                    a_neg,
+                    b_neg>,
+      TAs...>, TMs...>)
+{
+  return TiledMMA<MMA_Atom<
+    SM100_MMA_F16BF16_TS<a_type, b_type, c_type,
+                                M, N,
+                                a_major, b_major,
+                                a_neg, b_neg, UMMA::Saturate::False>,
+    TAs...>, TMs...>{};
+}
+```
+
+Thirdly, using `make_fragment_A` and `make_fragment_B` methods provided by `ThrMMA` instantiation to create GEMM input which is in SMEM.  
+```
+Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
+Tensor sK = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
+Tensor sV = make_tensor(make_smem_ptr(storage.smem_v.data()), SmemLayoutV{});
+
+Tensor tSrQ = thr_mma_qk.make_fragment_A(sQ);
+Tensor tSrK = thr_mma_qk.make_fragment_B(sK);
+Tensor tOrV = thr_mma_pv.make_fragment_B(sV);
+```
+
+Note that the `make_fragment_A` and `make_fragment_B` methods do not allocate memory for the fragment or change its layout. Instead, they perform a type conversion to match the interface required by `cute::gemm()`.
+
+However, for the tensor P in GEMM PV, special handling is required because it is stored in TMEM. The memory for P must be allocated manually by the user, as shown below:
+```
+// Element needs half precision
+Tensor sP    = make_tensor(make_smem_ptr((Element*)nullptr), typename CollectiveMmaPV::SmemLayoutA{});
+Tensor tOrP  = thr_mma_pv.make_fragment_A(sP)(_, _, _, 0);
+
+Tensor tOrP0 = tOrP;
+tOrP0.data() = tOrP.data().get() + uint32_t(TmemAllocation::P0);
+```
+
+Finally, due to the use of TMEM, storage memory must be allocated manually, and users should partition the memory space appropriately.
+```
+// tmem layout is
+// S0 S1`O0 O1
+// sequential in memory, where S overlaps with P and V
+Tensor tStS = partition_fragment_C(mma_qk, select<0,1>(TileShapeQK{}));
+Tensor tOtO = partition_fragment_C(mma_pv_ts, select<0,1>(TileShapePV{}));
+
+Tensor tStS0 = tStS;
+tStS0.data() = tStS.data().get() + uint32_t(TmemAllocation::S0);
+Tensor tStS1 = tStS;
+tStS1.data() = tStS.data().get() + uint32_t(TmemAllocation::S1);
+
+Tensor tOtO0 = tOtO;
+tOtO0.data() = tOtO.data().get() + uint32_t(TmemAllocation::O0);
+Tensor tOtO1 = tOtO;
+tOtO1.data() = tOtO.data().get() + uint32_t(TmemAllocation::O1);
+```
+
+Note that when using TMEM, `partition_fragment_C` must be used instead of `make_fragment_C`. The `make_fragment_C` method allocates register memory based on the shape of the input tensor.
+
+### Computation Pipeline
+The computation pipeline diagram can be found in the Overview section, which provides detailed information. Next, we will offer additional details about GEMM. First, let's look at a code snippet.
+```
+template<typename Atom, typename TA, typename TB, typename TC>
+CUTE_DEVICE void 
+gemm_reset_zero_acc(Atom& atom, TA const& tA, TB const& tB, TC&& tC) 
+{
+  constexpr int rA = decltype(rank(tA))::value;
+  constexpr int rB = decltype(rank(tB))::value;
+  constexpr int rC = decltype(rank(tC))::value;
+  static_assert(rA == 3 && rB == 3 && rC == 3);
+
+  CUTLASS_PRAGMA_UNROLL
+  for (int k_block = 0; k_block < size<2>(tA); k_block++)
+  {
+    cute::gemm(atom, tA(_,_,k_block), tB(_,_,k_block), tC);
+    atom.accumulate_ = decltype(atom.accumulate_)::One;
+  }
+}
+```
+
+The above code shows that users need to write a for-loop along the K-dimension. This is because each tensor is partitioned into tiles, but each `cute::gemm()` operation processes only an atom-sized fragment.
+
+In addition, similar to the Load section, the MMA section only requires the value of 48 registers per thread.
+
+## Softmax
+The pipeline for the Softmax section has already been provided in the Overview. In this section, we will focus on some notable points. For example, two for-loops are required: one for unmasked tiles and another for masked tiles. The masked tiles should be set to the minimum value, since the GEMM operation computes the entire tile data.
+```
+// UnMasked iterations
+CUTLASS_PRAGMA_NO_UNROLL
+for (; mask_tile_count > 0; mask_tile_count -= 1)
+{
+  softmax_step<false /* need_apply_mask */>(
+      row_max, row_sum, stage,
+      (mask_tile_count == 1) &&
+          (Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape) == 0),
+      blk_coord, cS, params, problem_shape,
+      pipeline_s, pipeline_s_consumer_state,
+      pipeline_c, pipeline_c_producer_state,
+      order_s
+  );
+
+  cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});    //  Traverse the full unmasked tile across the N dimensions. 
+}
+```
+```
+// Masked iterations
+mask_tile_count = Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape);
+
+CUTLASS_PRAGMA_NO_UNROLL
+for (; mask_tile_count > 0; mask_tile_count -= 1)
+{
+  softmax_step<true /* need_apply_mask */>(
+      row_max, row_sum, stage, mask_tile_count == 1,
+      blk_coord, cS, params, problem_shape,
+      pipeline_s, pipeline_s_consumer_state,
+      pipeline_c, pipeline_c_producer_state,
+      order_s
+  );
+
+  cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
+}
+```
+
+It is worth noting that the input to the Softmax stage is the output of the MMA stage. Therefore, when obtaining tensors, users need to use both `partition_C` and `partition_fragment_C` as shown below:   
+```
+typename CollectiveMmaQK::TiledMma mma_qk;
+
+Tensor tScS = mma_qk.get_slice(0).partition_C(cS);
+Tensor tStS = partition_fragment_C(mma_qk, select<0,1>(TileShapeQK{}));
+```
+
+Next, we will introduce how to use TMEM, including copying data from SMEM to TMEM and vice versa, since the previous TMEM section did not cover specific usage details. First, let's look at a code snippet that demonstrates TMEM load as an example:
+```
+using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b32x;     // 4x32 threads with 128 cols of 32b elements
+
+int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
+
+auto tiled_tmem_load = make_tmem_copy(TMEM_LOAD{}, tStS);
+auto thr_tmem_load   = tiled_tmem_load.get_slice(thread_idx);
+Tensor tTMEM_LOADts  = thr_tmem_load.partition_S(tStS);
+tTMEM_LOADts.data()  = tTMEM_LOADts.data().get() + uint32_t(stage == _0{} ? TmemAllocation::S0 : TmemAllocation::S1);
+
+// read all of S from tmem into reg mem
+Tensor tTMEM_LOADrS = make_tensor<ElementQK>(shape(tTMEM_LOADcS));
+copy(tiled_tmem_load, tTMEM_LOADts, tTMEM_LOADrS);
+```
+
+The above code demonstrates the complete TMEM usage flow. The parameters for `SM100_TMEM_LOAD_32dp32b32x` are referenced from the previous TMEM section in the Kernel Layer. `make_tmem_copy` is used to create a `TiledCopy`, and `tStS` is a tensor that provides the required shape. Note that `get_slice()` should use the thread index within the warp group, rather than the block index within the cluster. After this step, a `ThrCopy` object is obtained.
+
+In addition, since this is a load example, TMEM serves as the source address, so `partition_S` should be used. Otherwise, use `partition_D` for the destination. Users also need to manually partition TMEM. Note that the destination address for `cute::copy()` is register memory, as shown below:
+```
+Tensor tTMEM_LOADrS = make_tensor<ElementQK>(shape(tTMEM_LOADcS));
+```
+```
+// tTMEM_LOADrS
+cute::Tensor<cute::ArrayEngine<FwdRunner::ElementAccumulatorQK, 128UL>, cute::Layout<cute::tuple<cute::tuple<cute::_32, cute::_1>, cute::_4, cute::_1, cute::_1>, cute::tuple<cute::tuple<cute::_1, cute::_0>, cute::C<32>, cute::C<0>, cute::C<0>>>>
+```
+
+The above code indicates that tTMEM_LOADrS uses 128 registers. Note that when using half precision (fp16), it is recommended that the N dimension of the GEMM does not approach 128, as this may cause register spilling.
+
+In addition, when computing the elements of tensor P, it is recommended to use vector addition and multiplication whenever possible. Furthermore, when copying data from registers to TMEM, users need to synchronize if the data will be used immediately afterwards, as shown below:
+```
+copy(tiled_tmem_store, tTMEM_STORErS(_, _, size<2>(tTMEM_STORErS) - 1), tTMEM_STOREtS(_, _, size<2>(tTMEM_STORErS) - 1));
+
+cutlass::arch::fence_view_async_tmem_store();
+```
+
+## Correction
+As we know, we generally use split-K strategies in GEMM operations to improve L2 cache hit rates. The Correction step computes the maximum value and sum along the k-dimension or hidden-size dimension. Meanwhile, since tiles along the k-dimension need to be accumulated, the previous results must be updated with the current maximum value before performing the PV MMA operation.   
+
 Updating ... ... ...
